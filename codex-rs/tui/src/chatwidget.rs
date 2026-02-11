@@ -6722,6 +6722,22 @@ impl ChatWidget {
             .set_composer_text(text, text_elements, local_image_paths);
     }
 
+    pub(crate) fn set_composer_cursor(&mut self, pos: usize) {
+        self.bottom_pane.set_composer_cursor(pos);
+    }
+
+    pub(crate) fn composer_text(&self) -> String {
+        self.bottom_pane.composer_text()
+    }
+
+    pub(crate) fn composer_cursor(&self) -> usize {
+        self.bottom_pane.composer_cursor()
+    }
+
+    pub(crate) fn is_task_running(&self) -> bool {
+        self.bottom_pane.is_task_running()
+    }
+
     pub(crate) fn show_esc_backtrack_hint(&mut self) {
         self.bottom_pane.show_esc_backtrack_hint();
     }

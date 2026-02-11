@@ -447,6 +447,11 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_composer_cursor(&mut self, pos: usize) {
+        self.composer.set_cursor(pos);
+        self.request_redraw();
+    }
+
     /// Replace the composer text while preserving mention link targets.
     ///
     /// Use this when rehydrating a draft after a local validation/gating
@@ -486,6 +491,10 @@ impl BottomPane {
     /// Get the current composer text (for tests and programmatic checks).
     pub(crate) fn composer_text(&self) -> String {
         self.composer.current_text()
+    }
+
+    pub(crate) fn composer_cursor(&self) -> usize {
+        self.composer.current_cursor()
     }
 
     pub(crate) fn composer_text_elements(&self) -> Vec<TextElement> {

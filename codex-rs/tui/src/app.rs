@@ -99,6 +99,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::time::interval;
 use toml::Value as TomlValue;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
@@ -1199,6 +1200,8 @@ impl App {
         tokio::pin!(tui_events);
 
         tui.frame_requester().schedule_frame();
+        let talon_paths = crate::talon::resolve_paths().ok();
+        let mut talon_tick = interval(Duration::from_millis(200));
 
         let mut thread_created_rx = thread_manager.subscribe_thread_created();
         let mut listen_for_threads = true;
@@ -1224,6 +1227,9 @@ impl App {
                 }
                 Some(event) = tui_events.next() => {
                     app.handle_tui_event(tui, event).await?
+                }
+                _ = talon_tick.tick() => {
+                    app.handle_talon_tick(tui, talon_paths.as_ref())?
                 }
                 // Listen on new thread creation due to collab tools.
                 created = thread_created_rx.recv(), if listen_for_threads => {
@@ -1254,6 +1260,84 @@ impl App {
             update_action: app.pending_update_action,
             exit_reason,
         })
+    }
+
+    fn talon_editor_state(&self) -> crate::talon::TalonEditorState {
+        crate::talon::TalonEditorState {
+            buffer: self.chat_widget.composer_text(),
+            cursor: self.chat_widget.composer_cursor(),
+            is_task_running: self.chat_widget.is_task_running(),
+            session_id: self.chat_widget.thread_id().map(|id| id.to_string()),
+            cwd: Some(self.config.cwd.display().to_string()),
+        }
+    }
+
+    fn handle_talon_tick(
+        &mut self,
+        tui: &mut tui::Tui,
+        paths: Option<&crate::talon::TalonPaths>,
+    ) -> Result<AppRunControl> {
+        let Some(paths) = paths else {
+            return Ok(AppRunControl::Continue);
+        };
+
+        let mut applied = Vec::new();
+        let mut error = None;
+
+        match crate::talon::read_request(paths) {
+            Ok(Some(request)) => {
+                for command in request.commands {
+                    use crate::talon::TalonCommand::*;
+                    match command {
+                        SetBuffer { text, cursor } => {
+                            self.chat_widget
+                                .set_composer_text(text, Vec::new(), Vec::new());
+                            if let Some(pos) = cursor {
+                                self.chat_widget.set_composer_cursor(pos);
+                            }
+                            applied.push("set_buffer".to_string());
+                        }
+                        SetCursor { cursor } => {
+                            self.chat_widget.set_composer_cursor(cursor);
+                            applied.push("set_cursor".to_string());
+                        }
+                        GetState => {
+                            applied.push("get_state".to_string());
+                        }
+                        Notify { message } => {
+                            let _ = tui.notify(message);
+                            applied.push("notify".to_string());
+                        }
+                    }
+                }
+            }
+            Ok(None) => return Ok(AppRunControl::Continue),
+            Err(err) => {
+                error = Some(err.to_string());
+            }
+        }
+
+        let status = if error.is_some() {
+            crate::talon::TalonResponseStatus::Error
+        } else if applied.is_empty() {
+            crate::talon::TalonResponseStatus::NoRequest
+        } else {
+            crate::talon::TalonResponseStatus::Ok
+        };
+
+        let response = crate::talon::TalonResponse {
+            version: 1,
+            status,
+            state: self.talon_editor_state(),
+            applied,
+            error,
+            timestamp_ms: crate::talon::now_timestamp_ms(),
+        };
+
+        let _ = crate::talon::write_response(paths, &response);
+        let _ = crate::talon::remove_request(paths);
+        tui.frame_requester().schedule_frame();
+        Ok(AppRunControl::Continue)
     }
 
     pub(crate) async fn handle_tui_event(

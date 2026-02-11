@@ -413,6 +413,15 @@ impl ChatComposer {
         this
     }
 
+    pub(crate) fn current_cursor(&self) -> usize {
+        self.textarea.cursor()
+    }
+
+    pub(crate) fn set_cursor(&mut self, pos: usize) {
+        self.textarea.set_cursor(pos);
+        self.sync_popups();
+    }
+
     pub fn set_skill_mentions(&mut self, skills: Option<Vec<SkillMetadata>>) {
         self.skills = skills;
     }
