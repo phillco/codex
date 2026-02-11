@@ -56,4 +56,11 @@ You can also use Codex with an API key, but this requires [additional setup](htt
 - [**Installing & building**](./docs/install.md)
 - [**Open source fund**](./docs/open-source-fund.md)
 
+### Fork notes (this branch)
+
+This branch adds a minimal Talon file-RPC interface for `codex-tui` so external tools can inspect and edit composer state (buffer text and cursor position) via `~/.codex-talon/request.json` and `~/.codex-talon/response.json`.
+
+- [**Talon file RPC (minimal)**](./docs/talon-file-rpc.md)
+- helper CLI: `cargo run -p codex-tui --bin talon_send -- <subcommand>`
+
 This repository is licensed under the [Apache-2.0 License](LICENSE).
