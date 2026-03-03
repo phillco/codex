@@ -1,3 +1,4 @@
+use codex_network_proxy::NetworkProxy;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -35,15 +36,29 @@ pub enum StdioPolicy {
 /// For now, we take `SandboxPolicy` as a parameter to spawn_child() because
 /// we need to determine whether to set the
 /// `CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR` environment variable.
-pub(crate) async fn spawn_child_async(
-    program: PathBuf,
-    args: Vec<String>,
-    #[cfg_attr(not(unix), allow(unused_variables))] arg0: Option<&str>,
-    cwd: PathBuf,
-    sandbox_policy: &SandboxPolicy,
-    stdio_policy: StdioPolicy,
-    env: HashMap<String, String>,
-) -> std::io::Result<Child> {
+pub(crate) struct SpawnChildRequest<'a> {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub arg0: Option<&'a str>,
+    pub cwd: PathBuf,
+    pub sandbox_policy: &'a SandboxPolicy,
+    pub network: Option<&'a NetworkProxy>,
+    pub stdio_policy: StdioPolicy,
+    pub env: HashMap<String, String>,
+}
+
+pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io::Result<Child> {
+    let SpawnChildRequest {
+        program,
+        args,
+        arg0,
+        cwd,
+        sandbox_policy,
+        network,
+        stdio_policy,
+        mut env,
+    } = request;
+
     trace!(
         "spawn_child_async: {program:?} {args:?} {arg0:?} {cwd:?} {sandbox_policy:?} {stdio_policy:?} {env:?}"
     );
@@ -53,6 +68,9 @@ pub(crate) async fn spawn_child_async(
     cmd.arg0(arg0.map_or_else(|| program.to_string_lossy().to_string(), String::from));
     cmd.args(args);
     cmd.current_dir(cwd);
+    if let Some(network) = network {
+        network.apply_to_env(&mut env);
+    }
     cmd.env_clear();
     cmd.envs(env);
 
@@ -64,22 +82,22 @@ pub(crate) async fn spawn_child_async(
     // any child processes that were spawned as part of a `"shell"` tool call
     // to also be terminated.
 
-    // This relies on prctl(2), so it only works on Linux.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     unsafe {
-        cmd.pre_exec(|| {
-            // This prctl call effectively requests, "deliver SIGTERM when my
-            // current parent dies."
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                return Err(std::io::Error::last_os_error());
+        let detach_from_tty = matches!(stdio_policy, StdioPolicy::RedirectForShellTool);
+        #[cfg(target_os = "linux")]
+        let parent_pid = libc::getpid();
+        cmd.pre_exec(move || {
+            if detach_from_tty {
+                codex_utils_pty::process_group::detach_from_tty()?;
             }
 
-            // Though if there was a race condition and this pre_exec() block is
-            // run _after_ the parent (i.e., the Codex process) has already
-            // exited, then the parent is the _init_ process (which will never
-            // die), so we should just terminate the child process now.
-            if libc::getppid() == 1 {
-                libc::raise(libc::SIGTERM);
+            // This relies on prctl(2), so it only works on Linux.
+            #[cfg(target_os = "linux")]
+            {
+                // This prctl call effectively requests, "deliver SIGTERM when my
+                // current parent dies."
+                codex_utils_pty::process_group::set_parent_death_signal(parent_pid)?;
             }
             Ok(())
         });

@@ -1,16 +1,13 @@
-use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::protocol::FileChange;
-use crate::protocol::ReviewDecision;
 use crate::safety::SafetyCheck;
 use crate::safety::assess_patch_safety;
+use crate::tools::sandboxing::ExecApprovalRequirement;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-pub const CODEX_APPLY_PATCH_ARG1: &str = "--codex-run-as-apply-patch";
 
 pub(crate) enum InternalApplyPatchInvocation {
     /// The `apply_patch` call was handled programmatically, without any sort
@@ -21,7 +18,8 @@ pub(crate) enum InternalApplyPatchInvocation {
     /// The `apply_patch` call was approved, either automatically because it
     /// appears that it should be allowed based on the user's sandbox policy
     /// *or* because the user explicitly approved it. In either case, we use
-    /// exec with [`CODEX_APPLY_PATCH_ARG1`] to realize the `apply_patch` call,
+    /// exec with [`codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1`] to realize
+    /// the `apply_patch` call,
     /// but [`ApplyPatchExec::auto_approved`] is used to determine the sandbox
     /// used with the `exec()`.
     DelegateToExec(ApplyPatchExec),
@@ -30,53 +28,44 @@ pub(crate) enum InternalApplyPatchInvocation {
 #[derive(Debug)]
 pub(crate) struct ApplyPatchExec {
     pub(crate) action: ApplyPatchAction,
-    pub(crate) user_explicitly_approved_this_action: bool,
+    pub(crate) auto_approved: bool,
+    pub(crate) exec_approval_requirement: ExecApprovalRequirement,
 }
 
 pub(crate) async fn apply_patch(
-    sess: &Session,
     turn_context: &TurnContext,
-    sub_id: &str,
-    call_id: &str,
     action: ApplyPatchAction,
 ) -> InternalApplyPatchInvocation {
     match assess_patch_safety(
         &action,
-        turn_context.approval_policy,
-        &turn_context.sandbox_policy,
+        turn_context.approval_policy.value(),
+        turn_context.sandbox_policy.get(),
         &turn_context.cwd,
+        turn_context.windows_sandbox_level,
     ) {
         SafetyCheck::AutoApprove {
             user_explicitly_approved,
             ..
         } => InternalApplyPatchInvocation::DelegateToExec(ApplyPatchExec {
             action,
-            user_explicitly_approved_this_action: user_explicitly_approved,
+            auto_approved: !user_explicitly_approved,
+            exec_approval_requirement: ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            },
         }),
         SafetyCheck::AskUser => {
-            // Compute a readable summary of path changes to include in the
-            // approval request so the user can make an informed decision.
-            //
-            // Note that it might be worth expanding this approval request to
-            // give the user the option to expand the set of writable roots so
-            // that similar patches can be auto-approved in the future during
-            // this session.
-            let rx_approve = sess
-                .request_patch_approval(sub_id.to_owned(), call_id.to_owned(), &action, None, None)
-                .await;
-            match rx_approve.await.unwrap_or_default() {
-                ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
-                    InternalApplyPatchInvocation::DelegateToExec(ApplyPatchExec {
-                        action,
-                        user_explicitly_approved_this_action: true,
-                    })
-                }
-                ReviewDecision::Denied | ReviewDecision::Abort => {
-                    InternalApplyPatchInvocation::Output(Err(FunctionCallError::RespondToModel(
-                        "patch rejected by user".to_string(),
-                    )))
-                }
-            }
+            // Delegate the approval prompt (including cached approvals) to the
+            // tool runtime, consistent with how shell/unified_exec approvals
+            // are orchestrator-driven.
+            InternalApplyPatchInvocation::DelegateToExec(ApplyPatchExec {
+                action,
+                auto_approved: false,
+                exec_approval_requirement: ExecApprovalRequirement::NeedsApproval {
+                    reason: None,
+                    proposed_execpolicy_amendment: None,
+                },
+            })
         }
         SafetyCheck::Reject { reason } => InternalApplyPatchInvocation::Output(Err(
             FunctionCallError::RespondToModel(format!("patch rejected: {reason}")),

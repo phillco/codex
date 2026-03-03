@@ -10,21 +10,23 @@ use axum::extract::State;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
+use axum::http::header::CONTENT_TYPE;
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::Response;
+use axum::routing::get;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::ServerHandler;
-use rmcp::model::CallToolRequestParam;
+use rmcp::model::CallToolRequestParams;
 use rmcp::model::CallToolResult;
 use rmcp::model::JsonObject;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
 use rmcp::model::ListToolsResult;
-use rmcp::model::PaginatedRequestParam;
+use rmcp::model::PaginatedRequestParams;
 use rmcp::model::RawResource;
 use rmcp::model::RawResourceTemplate;
-use rmcp::model::ReadResourceRequestParam;
+use rmcp::model::ReadResourceRequestParams;
 use rmcp::model::ReadResourceResult;
 use rmcp::model::Resource;
 use rmcp::model::ResourceContents;
@@ -90,6 +92,7 @@ impl TestToolServer {
             mime_type: Some("text/plain".to_string()),
             size: None,
             icons: None,
+            meta: None,
         };
         Resource::new(raw, None)
     }
@@ -103,6 +106,7 @@ impl TestToolServer {
                 "Template for memo://codex/{slug} resources used in tests.".to_string(),
             ),
             mime_type: Some("text/plain".to_string()),
+            icons: None,
         };
         ResourceTemplate::new(raw, None)
     }
@@ -133,7 +137,7 @@ impl ServerHandler for TestToolServer {
 
     fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         let tools = self.tools.clone();
@@ -141,13 +145,14 @@ impl ServerHandler for TestToolServer {
             Ok(ListToolsResult {
                 tools: (*tools).clone(),
                 next_cursor: None,
+                meta: None,
             })
         }
     }
 
     fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
         let resources = self.resources.clone();
@@ -155,24 +160,26 @@ impl ServerHandler for TestToolServer {
             Ok(ListResourcesResult {
                 resources: (*resources).clone(),
                 next_cursor: None,
+                meta: None,
             })
         }
     }
 
     async fn list_resource_templates(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<ListResourceTemplatesResult, McpError> {
         Ok(ListResourceTemplatesResult {
             resource_templates: (*self.resource_templates).clone(),
             next_cursor: None,
+            meta: None,
         })
     }
 
     async fn read_resource(
         &self,
-        ReadResourceRequestParam { uri }: ReadResourceRequestParam,
+        ReadResourceRequestParams { uri, .. }: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         if uri == MEMO_URI {
@@ -194,7 +201,7 @@ impl ServerHandler for TestToolServer {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         match request.name.as_ref() {
@@ -256,14 +263,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("starting rmcp streamable http test server on http://{bind_addr}/mcp");
 
-    let router = Router::new().nest_service(
-        "/mcp",
-        StreamableHttpService::new(
-            || Ok(TestToolServer::new()),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
-        ),
-    );
+    let router = Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server/mcp",
+            get({
+                move || async move {
+                    let metadata_base = format!("http://{bind_addr}");
+                    #[expect(clippy::expect_used)]
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&json!({
+                                "authorization_endpoint": format!("{metadata_base}/oauth/authorize"),
+                                "token_endpoint": format!("{metadata_base}/oauth/token"),
+                                "scopes_supported": [""],
+                            })).expect("failed to serialize metadata"),
+                        ))
+                        .expect("valid metadata response")
+                }
+            }),
+        )
+        .nest_service(
+            "/mcp",
+            StreamableHttpService::new(
+                || Ok(TestToolServer::new()),
+                Arc::new(LocalSessionManager::default()),
+                StreamableHttpServerConfig::default(),
+            ),
+        );
 
     let router = if let Ok(token) = std::env::var("MCP_EXPECT_BEARER") {
         let expected = Arc::new(format!("Bearer {token}"));
@@ -282,6 +310,9 @@ async fn require_bearer(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    if request.uri().path().contains("/.well-known/") {
+        return Ok(next.run(request).await);
+    }
     if request
         .headers()
         .get(AUTHORIZATION)

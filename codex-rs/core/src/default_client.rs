@@ -1,8 +1,12 @@
+use crate::config_loader::ResidencyRequirement;
 use crate::spawn::CODEX_SANDBOX_ENV_VAR;
+use codex_client::CodexHttpClient;
+pub use codex_client::CodexRequestBuilder;
+use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 /// Set this to add a suffix to the User-Agent string.
 ///
@@ -22,12 +26,16 @@ use std::sync::OnceLock;
 pub static USER_AGENT_SUFFIX: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 pub const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
+pub const RESIDENCY_HEADER_NAME: &str = "x-openai-internal-codex-residency";
+
 #[derive(Debug, Clone)]
 pub struct Originator {
     pub value: String,
     pub header_value: HeaderValue,
 }
-static ORIGINATOR: OnceLock<Originator> = OnceLock::new();
+static ORIGINATOR: LazyLock<RwLock<Option<Originator>>> = LazyLock::new(|| RwLock::new(None));
+static REQUIREMENTS_RESIDENCY: LazyLock<RwLock<Option<ResidencyRequirement>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 #[derive(Debug)]
 pub enum SetOriginatorError {
@@ -57,22 +65,66 @@ fn get_originator_value(provided: Option<String>) -> Originator {
 }
 
 pub fn set_default_originator(value: String) -> Result<(), SetOriginatorError> {
+    if HeaderValue::from_str(&value).is_err() {
+        return Err(SetOriginatorError::InvalidHeaderValue);
+    }
     let originator = get_originator_value(Some(value));
-    ORIGINATOR
-        .set(originator)
-        .map_err(|_| SetOriginatorError::AlreadyInitialized)
+    let Ok(mut guard) = ORIGINATOR.write() else {
+        return Err(SetOriginatorError::AlreadyInitialized);
+    };
+    if guard.is_some() {
+        return Err(SetOriginatorError::AlreadyInitialized);
+    }
+    *guard = Some(originator);
+    Ok(())
 }
 
-pub fn originator() -> &'static Originator {
-    ORIGINATOR.get_or_init(|| get_originator_value(None))
+pub fn set_default_client_residency_requirement(enforce_residency: Option<ResidencyRequirement>) {
+    let Ok(mut guard) = REQUIREMENTS_RESIDENCY.write() else {
+        tracing::warn!("Failed to acquire requirements residency lock");
+        return;
+    };
+    *guard = enforce_residency;
+}
+
+pub fn originator() -> Originator {
+    if let Ok(guard) = ORIGINATOR.read()
+        && let Some(originator) = guard.as_ref()
+    {
+        return originator.clone();
+    }
+
+    if std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).is_ok() {
+        let originator = get_originator_value(None);
+        if let Ok(mut guard) = ORIGINATOR.write() {
+            match guard.as_ref() {
+                Some(originator) => return originator.clone(),
+                None => *guard = Some(originator.clone()),
+            }
+        }
+        return originator;
+    }
+
+    get_originator_value(None)
+}
+
+pub fn is_first_party_originator(originator_value: &str) -> bool {
+    originator_value == DEFAULT_ORIGINATOR
+        || originator_value == "codex_vscode"
+        || originator_value.starts_with("Codex ")
+}
+
+pub fn is_first_party_chat_originator(originator_value: &str) -> bool {
+    originator_value == "codex_atlas" || originator_value == "codex_chatgpt_desktop"
 }
 
 pub fn get_codex_user_agent() -> String {
     let build_version = env!("CARGO_PKG_VERSION");
     let os_info = os_info::get();
+    let originator = originator();
     let prefix = format!(
         "{}/{build_version} ({} {}; {}) {}",
-        originator().value.as_str(),
+        originator.value.as_str(),
         os_info.os_type(),
         os_info.version(),
         os_info.architecture().unwrap_or("unknown"),
@@ -120,27 +172,43 @@ fn sanitize_user_agent(candidate: String, fallback: &str) -> String {
         tracing::warn!(
             "Falling back to default Codex originator because base user agent string is invalid"
         );
-        originator().value.clone()
+        originator().value
     }
 }
 
-/// Create a reqwest client with default `originator` and `User-Agent` headers set.
-pub fn create_client() -> reqwest::Client {
-    use reqwest::header::HeaderMap;
+/// Create an HTTP client with default `originator` and `User-Agent` headers set.
+pub fn create_client() -> CodexHttpClient {
+    let inner = build_reqwest_client();
+    CodexHttpClient::new(inner)
+}
 
-    let mut headers = HeaderMap::new();
-    headers.insert("originator", originator().header_value.clone());
+pub fn build_reqwest_client() -> reqwest::Client {
     let ua = get_codex_user_agent();
 
     let mut builder = reqwest::Client::builder()
         // Set UA via dedicated helper to avoid header validation pitfalls
         .user_agent(ua)
-        .default_headers(headers);
+        .default_headers(default_headers());
     if is_sandboxed() {
         builder = builder.no_proxy();
     }
 
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+pub fn default_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("originator", originator().header_value);
+    if let Ok(guard) = REQUIREMENTS_RESIDENCY.read()
+        && let Some(requirement) = guard.as_ref()
+        && !headers.contains_key(RESIDENCY_HEADER_NAME)
+    {
+        let value = match requirement {
+            ResidencyRequirement::Us => HeaderValue::from_static("us"),
+        };
+        headers.insert(RESIDENCY_HEADER_NAME, value);
+    }
+    headers
 }
 
 fn is_sandboxed() -> bool {
@@ -151,16 +219,41 @@ fn is_sandboxed() -> bool {
 mod tests {
     use super::*;
     use core_test_support::skip_if_no_network;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_get_codex_user_agent() {
         let user_agent = get_codex_user_agent();
-        assert!(user_agent.starts_with("codex_cli_rs/"));
+        let originator = originator().value;
+        let prefix = format!("{originator}/");
+        assert!(user_agent.starts_with(&prefix));
+    }
+
+    #[test]
+    fn is_first_party_originator_matches_known_values() {
+        assert_eq!(is_first_party_originator(DEFAULT_ORIGINATOR), true);
+        assert_eq!(is_first_party_originator("codex_vscode"), true);
+        assert_eq!(is_first_party_originator("Codex Something Else"), true);
+        assert_eq!(is_first_party_originator("codex_cli"), false);
+        assert_eq!(is_first_party_originator("Other"), false);
+    }
+
+    #[test]
+    fn is_first_party_chat_originator_matches_known_values() {
+        assert_eq!(is_first_party_chat_originator("codex_atlas"), true);
+        assert_eq!(
+            is_first_party_chat_originator("codex_chatgpt_desktop"),
+            true
+        );
+        assert_eq!(is_first_party_chat_originator(DEFAULT_ORIGINATOR), false);
+        assert_eq!(is_first_party_chat_originator("codex_vscode"), false);
     }
 
     #[tokio::test]
     async fn test_create_client_sets_default_headers() {
         skip_if_no_network!();
+
+        set_default_client_residency_requirement(Some(ResidencyRequirement::Us));
 
         use wiremock::Mock;
         use wiremock::MockServer;
@@ -196,7 +289,7 @@ mod tests {
         let originator_header = headers
             .get("originator")
             .expect("originator header missing");
-        assert_eq!(originator_header.to_str().unwrap(), "codex_cli_rs");
+        assert_eq!(originator_header.to_str().unwrap(), originator().value);
 
         // User-Agent matches the computed Codex UA for that originator
         let expected_ua = get_codex_user_agent();
@@ -204,6 +297,13 @@ mod tests {
             .get("user-agent")
             .expect("user-agent header missing");
         assert_eq!(ua_header.to_str().unwrap(), expected_ua);
+
+        let residency_header = headers
+            .get(RESIDENCY_HEADER_NAME)
+            .expect("residency header missing");
+        assert_eq!(residency_header.to_str().unwrap(), "us");
+
+        set_default_client_residency_requirement(None);
     }
 
     #[test]
@@ -233,9 +333,10 @@ mod tests {
     fn test_macos() {
         use regex_lite::Regex;
         let user_agent = get_codex_user_agent();
-        let re = Regex::new(
-            r"^codex_cli_rs/\d+\.\d+\.\d+ \(Mac OS \d+\.\d+\.\d+; (x86_64|arm64)\) (\S+)$",
-        )
+        let originator = regex_lite::escape(originator().value.as_str());
+        let re = Regex::new(&format!(
+            r"^{originator}/\d+\.\d+\.\d+ \(Mac OS \d+\.\d+\.\d+; (x86_64|arm64)\) (\S+)$"
+        ))
         .unwrap();
         assert!(re.is_match(&user_agent));
     }

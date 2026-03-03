@@ -1,23 +1,25 @@
 use crate::history_cell::HistoryCell;
 use crate::history_cell::{self};
-use codex_core::config::Config;
+use crate::render::line_utils::prefix_lines;
+use crate::style::proposed_plan_style;
+use ratatui::prelude::Stylize;
 use ratatui::text::Line;
+use std::time::Duration;
+use std::time::Instant;
 
 use super::StreamState;
 
 /// Controller that manages newline-gated streaming, header emission, and
 /// commit animation across streams.
 pub(crate) struct StreamController {
-    config: Config,
     state: StreamState,
     finishing_after_drain: bool,
     header_emitted: bool,
 }
 
 impl StreamController {
-    pub(crate) fn new(config: Config, width: Option<usize>) -> Self {
+    pub(crate) fn new(width: Option<usize>) -> Self {
         Self {
-            config,
             state: StreamState::new(width),
             finishing_after_drain: false,
             header_emitted: false,
@@ -26,14 +28,13 @@ impl StreamController {
 
     /// Push a delta; if it contains a newline, commit completed lines and start animation.
     pub(crate) fn push(&mut self, delta: &str) -> bool {
-        let cfg = self.config.clone();
         let state = &mut self.state;
         if !delta.is_empty() {
             state.has_seen_delta = true;
         }
         state.collector.push_delta(delta);
         if delta.contains('\n') {
-            let newly_completed = state.collector.commit_complete_lines(&cfg);
+            let newly_completed = state.collector.commit_complete_lines();
             if !newly_completed.is_empty() {
                 state.enqueue(newly_completed);
                 return true;
@@ -44,11 +45,10 @@ impl StreamController {
 
     /// Finalize the active stream. Drain and emit now.
     pub(crate) fn finalize(&mut self) -> Option<Box<dyn HistoryCell>> {
-        let cfg = self.config.clone();
         // Finalize collector first.
         let remaining = {
             let state = &mut self.state;
-            state.collector.finalize_and_drain(&cfg)
+            state.collector.finalize_and_drain()
         };
         // Collect all output first to avoid emitting headers when there is no content.
         let mut out_lines = Vec::new();
@@ -73,6 +73,28 @@ impl StreamController {
         (self.emit(step), self.state.is_idle())
     }
 
+    /// Step animation: commit at most `max_lines` queued lines.
+    ///
+    /// This is intended for adaptive catch-up drains. Callers should keep `max_lines` bounded; a
+    /// very large value can collapse perceived animation into a single jump.
+    pub(crate) fn on_commit_tick_batch(
+        &mut self,
+        max_lines: usize,
+    ) -> (Option<Box<dyn HistoryCell>>, bool) {
+        let step = self.state.drain_n(max_lines.max(1));
+        (self.emit(step), self.state.is_idle())
+    }
+
+    /// Returns the current number of queued lines waiting to be displayed.
+    pub(crate) fn queued_lines(&self) -> usize {
+        self.state.queued_len()
+    }
+
+    /// Returns the age of the oldest queued line.
+    pub(crate) fn oldest_queued_age(&self, now: Instant) -> Option<Duration> {
+        self.state.oldest_queued_age(now)
+    }
+
     fn emit(&mut self, lines: Vec<Line<'static>>) -> Option<Box<dyn HistoryCell>> {
         if lines.is_empty() {
             return None;
@@ -85,22 +107,131 @@ impl StreamController {
     }
 }
 
+/// Controller that streams proposed plan markdown into a styled plan block.
+pub(crate) struct PlanStreamController {
+    state: StreamState,
+    header_emitted: bool,
+    top_padding_emitted: bool,
+}
+
+impl PlanStreamController {
+    pub(crate) fn new(width: Option<usize>) -> Self {
+        Self {
+            state: StreamState::new(width),
+            header_emitted: false,
+            top_padding_emitted: false,
+        }
+    }
+
+    /// Push a delta; if it contains a newline, commit completed lines and start animation.
+    pub(crate) fn push(&mut self, delta: &str) -> bool {
+        let state = &mut self.state;
+        if !delta.is_empty() {
+            state.has_seen_delta = true;
+        }
+        state.collector.push_delta(delta);
+        if delta.contains('\n') {
+            let newly_completed = state.collector.commit_complete_lines();
+            if !newly_completed.is_empty() {
+                state.enqueue(newly_completed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Finalize the active stream. Drain and emit now.
+    pub(crate) fn finalize(&mut self) -> Option<Box<dyn HistoryCell>> {
+        let remaining = {
+            let state = &mut self.state;
+            state.collector.finalize_and_drain()
+        };
+        let mut out_lines = Vec::new();
+        {
+            let state = &mut self.state;
+            if !remaining.is_empty() {
+                state.enqueue(remaining);
+            }
+            let step = state.drain_all();
+            out_lines.extend(step);
+        }
+
+        self.state.clear();
+        self.emit(out_lines, true)
+    }
+
+    /// Step animation: commit at most one queued line and handle end-of-drain cleanup.
+    pub(crate) fn on_commit_tick(&mut self) -> (Option<Box<dyn HistoryCell>>, bool) {
+        let step = self.state.step();
+        (self.emit(step, false), self.state.is_idle())
+    }
+
+    /// Step animation: commit at most `max_lines` queued lines.
+    ///
+    /// This is intended for adaptive catch-up drains. Callers should keep `max_lines` bounded; a
+    /// very large value can collapse perceived animation into a single jump.
+    pub(crate) fn on_commit_tick_batch(
+        &mut self,
+        max_lines: usize,
+    ) -> (Option<Box<dyn HistoryCell>>, bool) {
+        let step = self.state.drain_n(max_lines.max(1));
+        (self.emit(step, false), self.state.is_idle())
+    }
+
+    /// Returns the current number of queued plan lines waiting to be displayed.
+    pub(crate) fn queued_lines(&self) -> usize {
+        self.state.queued_len()
+    }
+
+    /// Returns the age of the oldest queued plan line.
+    pub(crate) fn oldest_queued_age(&self, now: Instant) -> Option<Duration> {
+        self.state.oldest_queued_age(now)
+    }
+
+    fn emit(
+        &mut self,
+        lines: Vec<Line<'static>>,
+        include_bottom_padding: bool,
+    ) -> Option<Box<dyn HistoryCell>> {
+        if lines.is_empty() && !include_bottom_padding {
+            return None;
+        }
+
+        let mut out_lines: Vec<Line<'static>> = Vec::new();
+        let is_stream_continuation = self.header_emitted;
+        if !self.header_emitted {
+            out_lines.push(vec!["• ".dim(), "Proposed Plan".bold()].into());
+            out_lines.push(Line::from(" "));
+            self.header_emitted = true;
+        }
+
+        let mut plan_lines: Vec<Line<'static>> = Vec::new();
+        if !self.top_padding_emitted {
+            plan_lines.push(Line::from(" "));
+            self.top_padding_emitted = true;
+        }
+        plan_lines.extend(lines);
+        if include_bottom_padding {
+            plan_lines.push(Line::from(" "));
+        }
+
+        let plan_style = proposed_plan_style();
+        let plan_lines = prefix_lines(plan_lines, "  ".into(), "  ".into())
+            .into_iter()
+            .map(|line| line.style(plan_style))
+            .collect::<Vec<_>>();
+        out_lines.extend(plan_lines);
+
+        Some(Box::new(history_cell::new_proposed_plan_stream(
+            out_lines,
+            is_stream_continuation,
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_core::config::Config;
-    use codex_core::config::ConfigOverrides;
-    use pretty_assertions::assert_eq;
-
-    async fn test_config() -> Config {
-        let overrides = ConfigOverrides {
-            cwd: std::env::current_dir().ok(),
-            ..Default::default()
-        };
-        Config::load_with_cli_overrides(vec![], overrides)
-            .await
-            .expect("load test config")
-    }
 
     fn lines_to_plain_strings(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
         lines
@@ -117,8 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn controller_loose_vs_tight_with_commit_ticks_matches_full() {
-        let cfg = test_config().await;
-        let mut ctrl = StreamController::new(cfg.clone(), None);
+        let mut ctrl = StreamController::new(None);
         let mut lines = Vec::new();
 
         // Exact deltas from the session log (section: Loose vs. tight list items)
@@ -216,7 +346,7 @@ mod tests {
         // Full render of the same source
         let source: String = deltas.iter().copied().collect();
         let mut rendered: Vec<ratatui::text::Line<'static>> = Vec::new();
-        crate::markdown::append_markdown(&source, None, &mut rendered, &cfg);
+        crate::markdown::append_markdown(&source, None, &mut rendered);
         let rendered_strs = lines_to_plain_strings(&rendered);
 
         assert_eq!(streamed, rendered_strs);

@@ -1,19 +1,26 @@
 use async_trait::async_trait;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputContentItem;
+use codex_protocol::openai_models::InputModality;
 use serde::Deserialize;
 use tokio::fs;
 
 use crate::function_tool::FunctionCallError;
-use crate::protocol::Event;
 use crate::protocol::EventMsg;
-use crate::protocol::InputItem;
 use crate::protocol::ViewImageToolCallEvent;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::local_image_content_items_with_label_number;
 
 pub struct ViewImageHandler;
+
+const VIEW_IMAGE_UNSUPPORTED_MESSAGE: &str =
+    "view_image is not allowed because you do not support image inputs";
 
 #[derive(Deserialize)]
 struct ViewImageArgs {
@@ -27,11 +34,21 @@ impl ToolHandler for ViewImageHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+        if !invocation
+            .turn
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            return Err(FunctionCallError::RespondToModel(
+                VIEW_IMAGE_UNSUPPORTED_MESSAGE.to_string(),
+            ));
+        }
+
         let ToolInvocation {
             session,
             turn,
             payload,
-            sub_id,
             call_id,
             ..
         } = invocation;
@@ -45,9 +62,7 @@ impl ToolHandler for ViewImageHandler {
             }
         };
 
-        let args: ViewImageArgs = serde_json::from_str(&arguments).map_err(|e| {
-            FunctionCallError::RespondToModel(format!("failed to parse function arguments: {e:?}"))
-        })?;
+        let args: ViewImageArgs = parse_arguments(&arguments)?;
 
         let abs_path = turn.resolve_path(Some(args.path));
 
@@ -66,27 +81,34 @@ impl ToolHandler for ViewImageHandler {
         }
         let event_path = abs_path.clone();
 
-        session
-            .inject_input(vec![InputItem::LocalImage { path: abs_path }])
-            .await
-            .map_err(|_| {
-                FunctionCallError::RespondToModel(
-                    "unable to attach image (no active task)".to_string(),
-                )
-            })?;
+        let content = local_image_content_items_with_label_number(&abs_path, None);
+        let content = content
+            .into_iter()
+            .map(|item| match item {
+                ContentItem::InputText { text } => {
+                    FunctionCallOutputContentItem::InputText { text }
+                }
+                ContentItem::InputImage { image_url } => {
+                    FunctionCallOutputContentItem::InputImage { image_url }
+                }
+                ContentItem::OutputText { text } => {
+                    FunctionCallOutputContentItem::InputText { text }
+                }
+            })
+            .collect();
 
         session
-            .send_event(Event {
-                id: sub_id.to_string(),
-                msg: EventMsg::ViewImageToolCall(ViewImageToolCallEvent {
+            .send_event(
+                turn.as_ref(),
+                EventMsg::ViewImageToolCall(ViewImageToolCallEvent {
                     call_id,
                     path: event_path,
                 }),
-            })
+            )
             .await;
 
         Ok(ToolOutput::Function {
-            content: "attached local image path".to_string(),
+            body: FunctionCallOutputBody::ContentItems(content),
             success: Some(true),
         })
     }

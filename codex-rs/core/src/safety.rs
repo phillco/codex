@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -7,11 +6,11 @@ use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 
 use crate::exec::SandboxType;
+use crate::util::resolve_path;
 
-use crate::command_safety::is_dangerous_command::command_might_be_dangerous;
-use crate::command_safety::is_safe_command::is_known_safe_command;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
+use codex_protocol::config_types::WindowsSandboxLevel;
 
 #[derive(Debug, PartialEq)]
 pub enum SafetyCheck {
@@ -30,6 +29,7 @@ pub fn assess_patch_safety(
     policy: AskForApproval,
     sandbox_policy: &SandboxPolicy,
     cwd: &Path,
+    windows_sandbox_level: WindowsSandboxLevel,
 ) -> SafetyCheck {
     if action.is_empty() {
         return SafetyCheck::Reject {
@@ -38,7 +38,10 @@ pub fn assess_patch_safety(
     }
 
     match policy {
-        AskForApproval::OnFailure | AskForApproval::Never | AskForApproval::OnRequest => {
+        AskForApproval::OnFailure
+        | AskForApproval::Never
+        | AskForApproval::OnRequest
+        | AskForApproval::Reject(_) => {
             // Continue to see if this can be auto-approved.
         }
         // TODO(ragona): I'm not sure this is actually correct? I believe in this case
@@ -48,32 +51,50 @@ pub fn assess_patch_safety(
         }
     }
 
-    // Even though the patch *appears* to be constrained to writable paths, it
-    // is possible that paths in the patch are hard links to files outside the
-    // writable roots, so we should still run `apply_patch` in a sandbox in that
-    // case.
+    let rejects_sandbox_approval = matches!(policy, AskForApproval::Never)
+        || matches!(
+            policy,
+            AskForApproval::Reject(reject_config) if reject_config.sandbox_approval
+        );
+
+    // Even though the patch appears to be constrained to writable paths, it is
+    // possible that paths in the patch are hard links to files outside the
+    // writable roots, so we should still run `apply_patch` in a sandbox in that case.
     if is_write_patch_constrained_to_writable_paths(action, sandbox_policy, cwd)
-        || policy == AskForApproval::OnFailure
+        || matches!(policy, AskForApproval::OnFailure)
     {
-        // Only auto‑approve when we can actually enforce a sandbox. Otherwise
-        // fall back to asking the user because the patch may touch arbitrary
-        // paths outside the project.
-        match get_platform_sandbox() {
-            Some(sandbox_type) => SafetyCheck::AutoApprove {
-                sandbox_type,
+        if matches!(
+            sandbox_policy,
+            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
+        ) {
+            // DangerFullAccess is intended to bypass sandboxing entirely.
+            SafetyCheck::AutoApprove {
+                sandbox_type: SandboxType::None,
                 user_explicitly_approved: false,
-            },
-            None if sandbox_policy == &SandboxPolicy::DangerFullAccess => {
-                // If the user has explicitly requested DangerFullAccess, then
-                // we can auto-approve even without a sandbox.
-                SafetyCheck::AutoApprove {
-                    sandbox_type: SandboxType::None,
+            }
+        } else {
+            // Only auto‑approve when we can actually enforce a sandbox. Otherwise
+            // fall back to asking the user because the patch may touch arbitrary
+            // paths outside the project.
+            match get_platform_sandbox(windows_sandbox_level != WindowsSandboxLevel::Disabled) {
+                Some(sandbox_type) => SafetyCheck::AutoApprove {
+                    sandbox_type,
                     user_explicitly_approved: false,
+                },
+                None => {
+                    if rejects_sandbox_approval {
+                        SafetyCheck::Reject {
+                            reason:
+                                "writing outside of the project; rejected by user approval settings"
+                                    .to_string(),
+                        }
+                    } else {
+                        SafetyCheck::AskUser
+                    }
                 }
             }
-            None => SafetyCheck::AskUser,
         }
-    } else if policy == AskForApproval::Never {
+    } else if rejects_sandbox_approval {
         SafetyCheck::Reject {
             reason: "writing outside of the project; rejected by user approval settings"
                 .to_string(),
@@ -83,129 +104,17 @@ pub fn assess_patch_safety(
     }
 }
 
-/// For a command to be run _without_ a sandbox, one of the following must be
-/// true:
-///
-/// - the user has explicitly approved the command
-/// - the command is on the "known safe" list
-/// - `DangerFullAccess` was specified and `UnlessTrusted` was not
-pub fn assess_command_safety(
-    command: &[String],
-    approval_policy: AskForApproval,
-    sandbox_policy: &SandboxPolicy,
-    approved: &HashSet<Vec<String>>,
-    with_escalated_permissions: bool,
-) -> SafetyCheck {
-    // Some commands look dangerous. Even if they are run inside a sandbox,
-    // unless the user has explicitly approved them, we should ask,
-    // or reject if the approval_policy tells us not to ask.
-    if command_might_be_dangerous(command) && !approved.contains(command) {
-        if approval_policy == AskForApproval::Never {
-            return SafetyCheck::Reject {
-                reason: "dangerous command detected; rejected by user approval settings"
-                    .to_string(),
-            };
-        }
-
-        return SafetyCheck::AskUser;
-    }
-
-    // A command is "trusted" because either:
-    // - it belongs to a set of commands we consider "safe" by default, or
-    // - the user has explicitly approved the command for this session
-    //
-    // Currently, whether a command is "trusted" is a simple boolean, but we
-    // should include more metadata on this command test to indicate whether it
-    // should be run inside a sandbox or not. (This could be something the user
-    // defines as part of `execpolicy`.)
-    //
-    // For example, when `is_known_safe_command(command)` returns `true`, it
-    // would probably be fine to run the command in a sandbox, but when
-    // `approved.contains(command)` is `true`, the user may have approved it for
-    // the session _because_ they know it needs to run outside a sandbox.
-
-    if is_known_safe_command(command) || approved.contains(command) {
-        let user_explicitly_approved = approved.contains(command);
-        return SafetyCheck::AutoApprove {
-            sandbox_type: SandboxType::None,
-            user_explicitly_approved,
-        };
-    }
-
-    assess_safety_for_untrusted_command(approval_policy, sandbox_policy, with_escalated_permissions)
-}
-
-pub(crate) fn assess_safety_for_untrusted_command(
-    approval_policy: AskForApproval,
-    sandbox_policy: &SandboxPolicy,
-    with_escalated_permissions: bool,
-) -> SafetyCheck {
-    use AskForApproval::*;
-    use SandboxPolicy::*;
-
-    match (approval_policy, sandbox_policy) {
-        (UnlessTrusted, _) => {
-            // Even though the user may have opted into DangerFullAccess,
-            // they also requested that we ask for approval for untrusted
-            // commands.
-            SafetyCheck::AskUser
-        }
-        (OnFailure, DangerFullAccess)
-        | (Never, DangerFullAccess)
-        | (OnRequest, DangerFullAccess) => SafetyCheck::AutoApprove {
-            sandbox_type: SandboxType::None,
-            user_explicitly_approved: false,
-        },
-        (OnRequest, ReadOnly) | (OnRequest, WorkspaceWrite { .. }) => {
-            if with_escalated_permissions {
-                SafetyCheck::AskUser
-            } else {
-                match get_platform_sandbox() {
-                    Some(sandbox_type) => SafetyCheck::AutoApprove {
-                        sandbox_type,
-                        user_explicitly_approved: false,
-                    },
-                    // Fall back to asking since the command is untrusted and
-                    // we do not have a sandbox available
-                    None => SafetyCheck::AskUser,
-                }
-            }
-        }
-        (Never, ReadOnly)
-        | (Never, WorkspaceWrite { .. })
-        | (OnFailure, ReadOnly)
-        | (OnFailure, WorkspaceWrite { .. }) => {
-            match get_platform_sandbox() {
-                Some(sandbox_type) => SafetyCheck::AutoApprove {
-                    sandbox_type,
-                    user_explicitly_approved: false,
-                },
-                None => {
-                    if matches!(approval_policy, OnFailure) {
-                        // Since the command is not trusted, even though the
-                        // user has requested to only ask for approval on
-                        // failure, we will ask the user because no sandbox is
-                        // available.
-                        SafetyCheck::AskUser
-                    } else {
-                        // We are in non-interactive mode and lack approval, so
-                        // all we can do is reject the command.
-                        SafetyCheck::Reject {
-                            reason: "auto-rejected because command is not on trusted list"
-                                .to_string(),
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-pub fn get_platform_sandbox() -> Option<SandboxType> {
+pub fn get_platform_sandbox(windows_sandbox_enabled: bool) -> Option<SandboxType> {
     if cfg!(target_os = "macos") {
         Some(SandboxType::MacosSeatbelt)
     } else if cfg!(target_os = "linux") {
         Some(SandboxType::LinuxSeccomp)
+    } else if cfg!(target_os = "windows") {
+        if windows_sandbox_enabled {
+            Some(SandboxType::WindowsRestrictedToken)
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -218,10 +127,10 @@ fn is_write_patch_constrained_to_writable_paths(
 ) -> bool {
     // Early‑exit if there are no declared writable roots.
     let writable_roots = match sandbox_policy {
-        SandboxPolicy::ReadOnly => {
+        SandboxPolicy::ReadOnly { .. } => {
             return false;
         }
-        SandboxPolicy::DangerFullAccess => {
+        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
             return true;
         }
         SandboxPolicy::WorkspaceWrite { .. } => sandbox_policy.get_writable_roots_with_cwd(cwd),
@@ -247,11 +156,7 @@ fn is_write_patch_constrained_to_writable_paths(
     // and roots are converted to absolute, normalized forms before the
     // prefix check.
     let is_path_writable = |p: &PathBuf| {
-        let abs = if p.is_absolute() {
-            p.clone()
-        } else {
-            cwd.join(p)
-        };
+        let abs = resolve_path(cwd, p);
         let abs = match normalize(&abs) {
             Some(v) => v,
             None => return false,
@@ -288,6 +193,8 @@ fn is_write_patch_constrained_to_writable_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::protocol::RejectConfig;
+    use codex_utils_absolute_path::AbsolutePathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -308,6 +215,7 @@ mod tests {
         // only `cwd` is writable by default.
         let policy_workspace_only = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
+            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
@@ -328,7 +236,8 @@ mod tests {
         // With the parent dir explicitly added as a writable root, the
         // outside write should be permitted.
         let policy_with_parent = SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![parent],
+            writable_roots: vec![AbsolutePathBuf::try_from(parent).unwrap()],
+            read_only_access: Default::default(),
             network_access: false,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
@@ -341,99 +250,102 @@ mod tests {
     }
 
     #[test]
-    fn test_request_escalated_privileges() {
-        // Should not be a trusted command
-        let command = vec!["git commit".to_string()];
-        let approval_policy = AskForApproval::OnRequest;
-        let sandbox_policy = SandboxPolicy::ReadOnly;
-        let approved: HashSet<Vec<String>> = HashSet::new();
-        let request_escalated_privileges = true;
+    fn external_sandbox_auto_approves_in_on_request() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let add_inside = ApplyPatchAction::new_add_for_test(&cwd.join("inner.txt"), "".to_string());
 
-        let safety_check = assess_command_safety(
-            &command,
-            approval_policy,
-            &sandbox_policy,
-            &approved,
-            request_escalated_privileges,
-        );
-
-        assert_eq!(safety_check, SafetyCheck::AskUser);
-    }
-
-    #[test]
-    fn dangerous_command_allowed_if_explicitly_approved() {
-        let command = vec!["git".to_string(), "reset".to_string(), "--hard".to_string()];
-        let approval_policy = AskForApproval::OnRequest;
-        let sandbox_policy = SandboxPolicy::ReadOnly;
-        let mut approved: HashSet<Vec<String>> = HashSet::new();
-        approved.insert(command.clone());
-        let request_escalated_privileges = false;
-
-        let safety_check = assess_command_safety(
-            &command,
-            approval_policy,
-            &sandbox_policy,
-            &approved,
-            request_escalated_privileges,
-        );
+        let policy = SandboxPolicy::ExternalSandbox {
+            network_access: codex_protocol::protocol::NetworkAccess::Enabled,
+        };
 
         assert_eq!(
-            safety_check,
+            assess_patch_safety(
+                &add_inside,
+                AskForApproval::OnRequest,
+                &policy,
+                &cwd,
+                WindowsSandboxLevel::Disabled
+            ),
             SafetyCheck::AutoApprove {
                 sandbox_type: SandboxType::None,
-                user_explicitly_approved: true,
+                user_explicitly_approved: false,
             }
         );
     }
 
     #[test]
-    fn dangerous_command_not_allowed_if_not_explicitly_approved() {
-        let command = vec!["git".to_string(), "reset".to_string(), "--hard".to_string()];
-        let approval_policy = AskForApproval::Never;
-        let sandbox_policy = SandboxPolicy::ReadOnly;
-        let approved: HashSet<Vec<String>> = HashSet::new();
-        let request_escalated_privileges = false;
-
-        let safety_check = assess_command_safety(
-            &command,
-            approval_policy,
-            &sandbox_policy,
-            &approved,
-            request_escalated_privileges,
-        );
+    fn reject_with_all_flags_false_matches_on_request_for_out_of_root_patch() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let parent = cwd.parent().unwrap().to_path_buf();
+        let add_outside =
+            ApplyPatchAction::new_add_for_test(&parent.join("outside.txt"), "".to_string());
+        let policy_workspace_only = SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![],
+            read_only_access: Default::default(),
+            network_access: false,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        };
 
         assert_eq!(
-            safety_check,
-            SafetyCheck::Reject {
-                reason: "dangerous command detected; rejected by user approval settings"
-                    .to_string(),
-            }
+            assess_patch_safety(
+                &add_outside,
+                AskForApproval::OnRequest,
+                &policy_workspace_only,
+                &cwd,
+                WindowsSandboxLevel::Disabled,
+            ),
+            SafetyCheck::AskUser,
+        );
+        assert_eq!(
+            assess_patch_safety(
+                &add_outside,
+                AskForApproval::Reject(RejectConfig {
+                    sandbox_approval: false,
+                    rules: false,
+                    mcp_elicitations: false,
+                }),
+                &policy_workspace_only,
+                &cwd,
+                WindowsSandboxLevel::Disabled,
+            ),
+            SafetyCheck::AskUser,
         );
     }
 
     #[test]
-    fn test_request_escalated_privileges_no_sandbox_fallback() {
-        let command = vec!["git".to_string(), "commit".to_string()];
-        let approval_policy = AskForApproval::OnRequest;
-        let sandbox_policy = SandboxPolicy::ReadOnly;
-        let approved: HashSet<Vec<String>> = HashSet::new();
-        let request_escalated_privileges = false;
-
-        let safety_check = assess_command_safety(
-            &command,
-            approval_policy,
-            &sandbox_policy,
-            &approved,
-            request_escalated_privileges,
-        );
-
-        let expected = match get_platform_sandbox() {
-            Some(sandbox_type) => SafetyCheck::AutoApprove {
-                sandbox_type,
-                user_explicitly_approved: false,
-            },
-            None => SafetyCheck::AskUser,
+    fn reject_sandbox_approval_rejects_out_of_root_patch() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let parent = cwd.parent().unwrap().to_path_buf();
+        let add_outside =
+            ApplyPatchAction::new_add_for_test(&parent.join("outside.txt"), "".to_string());
+        let policy_workspace_only = SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![],
+            read_only_access: Default::default(),
+            network_access: false,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
         };
-        assert_eq!(safety_check, expected);
+
+        assert_eq!(
+            assess_patch_safety(
+                &add_outside,
+                AskForApproval::Reject(RejectConfig {
+                    sandbox_approval: true,
+                    rules: false,
+                    mcp_elicitations: false,
+                }),
+                &policy_workspace_only,
+                &cwd,
+                WindowsSandboxLevel::Disabled,
+            ),
+            SafetyCheck::Reject {
+                reason: "writing outside of the project; rejected by user approval settings"
+                    .to_string(),
+            },
+        );
     }
 }

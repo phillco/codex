@@ -1,25 +1,21 @@
-use std::time::Duration;
-
 use codex_core::ModelProviderInfo;
 use codex_core::WireApi;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::InputItem;
-use codex_core::protocol::Op;
-use core_test_support::load_sse_fixture_with_id;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::user_input::UserInput;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::sse;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::wait_for_event_with_timeout;
+use core_test_support::wait_for_event;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
 use wiremock::matchers::body_string_contains;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
-
-fn sse_completed(id: &str) -> String {
-    load_sse_fixture_with_id("tests/fixtures/completed_template.json", id)
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn continue_after_stream_error() {
@@ -48,7 +44,13 @@ async fn continue_after_stream_error() {
 
     let ok = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse_completed("resp_ok2"), "text/event-stream");
+        .set_body_raw(
+            sse(vec![
+                ev_response_created("resp_ok2"),
+                ev_completed("resp_ok2"),
+            ]),
+            "text/event-stream",
+        );
 
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -66,6 +68,7 @@ async fn continue_after_stream_error() {
         base_url: Some(format!("{}/v1", server.uri())),
         env_key: Some("PATH".into()),
         env_key_instructions: None,
+        experimental_bearer_token: None,
         wire_api: WireApi::Responses,
         query_params: None,
         http_headers: None,
@@ -74,6 +77,7 @@ async fn continue_after_stream_error() {
         stream_max_retries: Some(1),
         stream_idle_timeout_ms: Some(2_000),
         requires_openai_auth: false,
+        supports_websockets: false,
     };
 
     let TestCodex { codex, .. } = test_codex()
@@ -87,44 +91,33 @@ async fn continue_after_stream_error() {
 
     codex
         .submit(Op::UserInput {
-            items: vec![InputItem::Text {
+            items: vec![UserInput::Text {
                 text: "first message".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await
         .unwrap();
 
-    // Expect an Error followed by TaskComplete so the session is released.
-    wait_for_event_with_timeout(
-        &codex,
-        |ev| matches!(ev, EventMsg::Error(_)),
-        Duration::from_secs(5),
-    )
-    .await;
+    // Expect an Error followed by TurnComplete so the session is released.
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
 
-    wait_for_event_with_timeout(
-        &codex,
-        |ev| matches!(ev, EventMsg::TaskComplete(_)),
-        Duration::from_secs(5),
-    )
-    .await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     // 2) Second turn: now send another prompt that should succeed using the
     // mock server SSE stream. If the agent failed to clear the running task on
     // error above, this submission would be rejected/queued indefinitely.
     codex
         .submit(Op::UserInput {
-            items: vec![InputItem::Text {
+            items: vec![UserInput::Text {
                 text: "follow up".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await
         .unwrap();
 
-    wait_for_event_with_timeout(
-        &codex,
-        |ev| matches!(ev, EventMsg::TaskComplete(_)),
-        Duration::from_secs(5),
-    )
-    .await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }

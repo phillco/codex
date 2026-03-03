@@ -2,7 +2,7 @@
 
 Embed the Codex agent in your workflows and apps.
 
-The TypeScript SDK wraps the bundled `codex` binary. It spawns the CLI and exchanges JSONL events over stdin/stdout.
+The TypeScript SDK wraps the `codex` CLI from `@openai/codex`. It spawns the CLI and exchanges JSONL events over stdin/stdout.
 
 ## Installation
 
@@ -33,7 +33,7 @@ const nextTurn = await thread.run("Implement the fix");
 
 ### Streaming responses
 
-`run()` buffers events until the turn finishes. To react to intermediate progress—tool calls, streaming responses, and file diffs—use `runStreamed()` instead, which returns an async generator of structured events.
+`run()` buffers events until the turn finishes. To react to intermediate progress—tool calls, streaming responses, and file change notifications—use `runStreamed()` instead, which returns an async generator of structured events.
 
 ```typescript
 const { events } = await thread.runStreamed("Diagnose the test failure and propose a fix");
@@ -83,6 +83,18 @@ const turn = await thread.run("Summarize repository status", {
 console.log(turn.finalResponse);
 ```
 
+### Attaching images
+
+Provide structured input entries when you need to include images alongside text. Text entries are concatenated into the final prompt while image entries are passed to the Codex CLI via `--image`.
+
+```typescript
+const turn = await thread.run([
+  { type: "text", text: "Describe these screenshots" },
+  { type: "local_image", path: "./ui.png" },
+  { type: "local_image", path: "./diagram.jpg" },
+]);
+```
+
 ### Resuming an existing thread
 
 Threads are persisted in `~/.codex/sessions`. If you lose the in-memory `Thread` object, reconstruct it with `resumeThread()` and keep going.
@@ -95,7 +107,7 @@ await thread.run("Implement the fix");
 
 ### Working directory controls
 
-Codex runs in the current working directory by default. To avoid unrecoverable errors, Codex requires the working directory to be a Git repository. You can skip the Git repository check by passing the `skipGitRepoCheck` option when creating a thread. 
+Codex runs in the current working directory by default. To avoid unrecoverable errors, Codex requires the working directory to be a Git repository. You can skip the Git repository check by passing the `skipGitRepoCheck` option when creating a thread.
 
 ```typescript
 const thread = codex.startThread({
@@ -103,3 +115,35 @@ const thread = codex.startThread({
   skipGitRepoCheck: true,
 });
 ```
+
+### Controlling the Codex CLI environment
+
+By default, the Codex CLI inherits the Node.js process environment. Provide the optional `env` parameter when instantiating the
+`Codex` client to fully control which variables the CLI receives—useful for sandboxed hosts like Electron apps.
+
+```typescript
+const codex = new Codex({
+  env: {
+    PATH: "/usr/local/bin",
+  },
+});
+```
+
+The SDK still injects its required variables (such as `OPENAI_BASE_URL` and `CODEX_API_KEY`) on top of the environment you
+provide.
+
+### Passing `--config` overrides
+
+Use the `config` option to provide additional Codex CLI configuration overrides. The SDK accepts a JSON object, flattens it
+into dotted paths, and serializes values as TOML literals before passing them as repeated `--config key=value` flags.
+
+```typescript
+const codex = new Codex({
+  config: {
+    show_raw_agent_reasoning: true,
+    sandbox_workspace_write: { network_access: true },
+  },
+});
+```
+
+Thread options still take precedence for overlapping settings because they are emitted after these global overrides.

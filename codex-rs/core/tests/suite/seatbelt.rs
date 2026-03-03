@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
-use codex_core::protocol::SandboxPolicy;
 use codex_core::seatbelt::spawn_command_under_seatbelt;
 use codex_core::spawn::CODEX_SANDBOX_ENV_VAR;
 use codex_core::spawn::StdioPolicy;
+use codex_protocol::protocol::SandboxPolicy;
 use tempfile::TempDir;
 
 struct TestScenario {
@@ -76,7 +76,8 @@ async fn if_parent_of_repo_is_writable_then_dot_git_folder_is_writable() {
     let tmp = TempDir::new().expect("should be able to create temp dir");
     let test_scenario = create_test_scenario(&tmp);
     let policy = SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![test_scenario.repo_parent.clone()],
+        writable_roots: vec![test_scenario.repo_parent.as_path().try_into().unwrap()],
+        read_only_access: Default::default(),
         network_access: false,
         exclude_tmpdir_env_var: true,
         exclude_slash_tmp: true,
@@ -102,7 +103,8 @@ async fn if_git_repo_is_writable_root_then_dot_git_folder_is_read_only() {
     let tmp = TempDir::new().expect("should be able to create temp dir");
     let test_scenario = create_test_scenario(&tmp);
     let policy = SandboxPolicy::WorkspaceWrite {
-        writable_roots: vec![test_scenario.repo_root.clone()],
+        writable_roots: vec![test_scenario.repo_root.as_path().try_into().unwrap()],
+        read_only_access: Default::default(),
         network_access: false,
         exclude_tmpdir_env_var: true,
         exclude_slash_tmp: true,
@@ -145,7 +147,7 @@ async fn danger_full_access_allows_all_writes() {
 async fn read_only_forbids_all_writes() {
     let tmp = TempDir::new().expect("should be able to create temp dir");
     let test_scenario = create_test_scenario(&tmp);
-    let policy = SandboxPolicy::ReadOnly;
+    let policy = SandboxPolicy::new_read_only_policy();
 
     test_scenario
         .run_test(
@@ -159,24 +161,19 @@ async fn read_only_forbids_all_writes() {
         .await;
 }
 
-/// Verify that user lookups via `pwd.getpwuid(os.getuid())` work under the
-/// seatbelt sandbox. Prior to allowing the necessary mach‑lookup for
-/// OpenDirectory libinfo, this would fail with `KeyError: getpwuid(): uid not found`.
 #[tokio::test]
-async fn python_getpwuid_works_under_seatbelt() {
+async fn openpty_works_under_seatbelt() {
     if std::env::var(CODEX_SANDBOX_ENV_VAR) == Ok("seatbelt".to_string()) {
         eprintln!("{CODEX_SANDBOX_ENV_VAR} is set to 'seatbelt', skipping test.");
         return;
     }
 
-    // For local dev.
     if which::which("python3").is_err() {
         eprintln!("python3 not found in PATH, skipping test.");
         return;
     }
 
-    // ReadOnly is sufficient here since we are only exercising user lookup.
-    let policy = SandboxPolicy::ReadOnly;
+    let policy = SandboxPolicy::new_read_only_policy();
     let command_cwd = std::env::current_dir().expect("getcwd");
     let sandbox_cwd = command_cwd.clone();
 
@@ -184,13 +181,18 @@ async fn python_getpwuid_works_under_seatbelt() {
         vec![
             "python3".to_string(),
             "-c".to_string(),
-            // Print the passwd struct; success implies lookup worked.
-            "import pwd, os; print(pwd.getpwuid(os.getuid()))".to_string(),
+            r#"import os
+
+master, slave = os.openpty()
+os.write(slave, b"ping")
+assert os.read(master, 4) == b"ping""#
+                .to_string(),
         ],
         command_cwd,
         &policy,
         sandbox_cwd.as_path(),
         StdioPolicy::RedirectForShellTool,
+        None,
         HashMap::new(),
     )
     .await
@@ -201,6 +203,70 @@ async fn python_getpwuid_works_under_seatbelt() {
         .await
         .expect("should be able to wait for child process");
     assert!(status.success(), "python exited with {status:?}");
+}
+
+#[tokio::test]
+async fn java_home_finds_runtime_under_seatbelt() {
+    if std::env::var(CODEX_SANDBOX_ENV_VAR) == Ok("seatbelt".to_string()) {
+        eprintln!("{CODEX_SANDBOX_ENV_VAR} is set to 'seatbelt', skipping test.");
+        return;
+    }
+
+    let java_home_path = Path::new("/usr/libexec/java_home");
+    if !java_home_path.exists() {
+        eprintln!("/usr/libexec/java_home is not present, skipping test.");
+        return;
+    }
+
+    let baseline_output = tokio::process::Command::new(java_home_path)
+        .env_remove("JAVA_HOME")
+        .output()
+        .await
+        .expect("should be able to invoke java_home outside seatbelt");
+    if !baseline_output.status.success() {
+        eprintln!(
+            "java_home exited with {:?} outside seatbelt, skipping test",
+            baseline_output.status
+        );
+        return;
+    }
+
+    let policy = SandboxPolicy::new_read_only_policy();
+    let command_cwd = std::env::current_dir().expect("getcwd");
+    let sandbox_cwd = command_cwd.clone();
+
+    let mut env: HashMap<String, String> = std::env::vars().collect();
+    env.remove("JAVA_HOME");
+    env.remove(CODEX_SANDBOX_ENV_VAR);
+
+    let child = spawn_command_under_seatbelt(
+        vec![java_home_path.to_string_lossy().to_string()],
+        command_cwd,
+        &policy,
+        sandbox_cwd.as_path(),
+        StdioPolicy::RedirectForShellTool,
+        None,
+        env,
+    )
+    .await
+    .expect("should be able to spawn java_home under seatbelt");
+
+    let output = child
+        .wait_with_output()
+        .await
+        .expect("should be able to wait for java_home child");
+    assert!(
+        output.status.success(),
+        "java_home under seatbelt exited with {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.trim().is_empty(),
+        "java_home stdout unexpectedly empty under seatbelt"
+    );
 }
 
 #[expect(clippy::expect_used)]
@@ -236,6 +302,7 @@ async fn touch(path: &Path, policy: &SandboxPolicy) -> bool {
         policy,
         sandbox_cwd.as_path(),
         StdioPolicy::RedirectForShellTool,
+        None,
         HashMap::new(),
     )
     .await

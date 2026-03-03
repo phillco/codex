@@ -1,28 +1,26 @@
+use codex_protocol::models::FunctionCallOutputBody;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use mcp_types::CallToolResult;
-use mcp_types::ContentBlock;
-use mcp_types::ListResourceTemplatesRequestParams;
-use mcp_types::ListResourceTemplatesResult;
-use mcp_types::ListResourcesRequestParams;
-use mcp_types::ListResourcesResult;
-use mcp_types::ReadResourceRequestParams;
-use mcp_types::ReadResourceResult;
-use mcp_types::Resource;
-use mcp_types::ResourceTemplate;
-use mcp_types::TextContent;
+use codex_protocol::mcp::CallToolResult;
+use rmcp::model::ListResourceTemplatesResult;
+use rmcp::model::ListResourcesResult;
+use rmcp::model::PaginatedRequestParams;
+use rmcp::model::ReadResourceRequestParams;
+use rmcp::model::ReadResourceResult;
+use rmcp::model::Resource;
+use rmcp::model::ResourceTemplate;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::codex::Session;
+use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
-use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::McpInvocation;
 use crate::protocol::McpToolCallBeginEvent;
@@ -189,7 +187,7 @@ impl ToolHandler for McpResourceHandler {
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
             session,
-            sub_id,
+            turn,
             call_id,
             tool_name,
             payload,
@@ -211,7 +209,7 @@ impl ToolHandler for McpResourceHandler {
             "list_mcp_resources" => {
                 handle_list_resources(
                     Arc::clone(&session),
-                    sub_id.clone(),
+                    Arc::clone(&turn),
                     call_id.clone(),
                     arguments_value.clone(),
                 )
@@ -220,14 +218,20 @@ impl ToolHandler for McpResourceHandler {
             "list_mcp_resource_templates" => {
                 handle_list_resource_templates(
                     Arc::clone(&session),
-                    sub_id.clone(),
+                    Arc::clone(&turn),
                     call_id.clone(),
                     arguments_value.clone(),
                 )
                 .await
             }
             "read_mcp_resource" => {
-                handle_read_resource(Arc::clone(&session), sub_id, call_id, arguments_value).await
+                handle_read_resource(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    call_id,
+                    arguments_value,
+                )
+                .await
             }
             other => Err(FunctionCallError::RespondToModel(format!(
                 "unsupported MCP resource tool: {other}"
@@ -238,7 +242,7 @@ impl ToolHandler for McpResourceHandler {
 
 async fn handle_list_resources(
     session: Arc<Session>,
-    sub_id: String,
+    turn: Arc<TurnContext>,
     call_id: String,
     arguments: Option<Value>,
 ) -> Result<ToolOutput, FunctionCallError> {
@@ -253,12 +257,13 @@ async fn handle_list_resources(
         arguments: arguments.clone(),
     };
 
-    emit_tool_call_begin(&session, &sub_id, &call_id, invocation.clone()).await;
+    emit_tool_call_begin(&session, turn.as_ref(), &call_id, invocation.clone()).await;
     let start = Instant::now();
 
     let payload_result: Result<ListResourcesPayload, FunctionCallError> = async {
         if let Some(server_name) = server.clone() {
-            let params = cursor.clone().map(|value| ListResourcesRequestParams {
+            let params = cursor.clone().map(|value| PaginatedRequestParams {
+                meta: None,
                 cursor: Some(value),
             });
             let result = session
@@ -281,6 +286,8 @@ async fn handle_list_resources(
             let resources = session
                 .services
                 .mcp_connection_manager
+                .read()
+                .await
                 .list_all_resources()
                 .await;
             Ok(ListResourcesPayload::from_all_servers(resources))
@@ -291,17 +298,18 @@ async fn handle_list_resources(
     match payload_result {
         Ok(payload) => match serialize_function_output(payload) {
             Ok(output) => {
-                let ToolOutput::Function { content, success } = &output else {
+                let ToolOutput::Function { body, success } = &output else {
                     unreachable!("MCP resource handler should return function output");
                 };
+                let content = body.to_text().unwrap_or_default();
                 let duration = start.elapsed();
                 emit_tool_call_end(
                     &session,
-                    &sub_id,
+                    turn.as_ref(),
                     &call_id,
                     invocation,
                     duration,
-                    Ok(call_tool_result_from_content(content, *success)),
+                    Ok(call_tool_result_from_content(&content, *success)),
                 )
                 .await;
                 Ok(output)
@@ -311,7 +319,7 @@ async fn handle_list_resources(
                 let message = err.to_string();
                 emit_tool_call_end(
                     &session,
-                    &sub_id,
+                    turn.as_ref(),
                     &call_id,
                     invocation,
                     duration,
@@ -326,7 +334,7 @@ async fn handle_list_resources(
             let message = err.to_string();
             emit_tool_call_end(
                 &session,
-                &sub_id,
+                turn.as_ref(),
                 &call_id,
                 invocation,
                 duration,
@@ -340,7 +348,7 @@ async fn handle_list_resources(
 
 async fn handle_list_resource_templates(
     session: Arc<Session>,
-    sub_id: String,
+    turn: Arc<TurnContext>,
     call_id: String,
     arguments: Option<Value>,
 ) -> Result<ToolOutput, FunctionCallError> {
@@ -355,16 +363,15 @@ async fn handle_list_resource_templates(
         arguments: arguments.clone(),
     };
 
-    emit_tool_call_begin(&session, &sub_id, &call_id, invocation.clone()).await;
+    emit_tool_call_begin(&session, turn.as_ref(), &call_id, invocation.clone()).await;
     let start = Instant::now();
 
     let payload_result: Result<ListResourceTemplatesPayload, FunctionCallError> = async {
         if let Some(server_name) = server.clone() {
-            let params = cursor
-                .clone()
-                .map(|value| ListResourceTemplatesRequestParams {
-                    cursor: Some(value),
-                });
+            let params = cursor.clone().map(|value| PaginatedRequestParams {
+                meta: None,
+                cursor: Some(value),
+            });
             let result = session
                 .list_resource_templates(&server_name, params)
                 .await
@@ -387,6 +394,8 @@ async fn handle_list_resource_templates(
             let templates = session
                 .services
                 .mcp_connection_manager
+                .read()
+                .await
                 .list_all_resource_templates()
                 .await;
             Ok(ListResourceTemplatesPayload::from_all_servers(templates))
@@ -397,17 +406,18 @@ async fn handle_list_resource_templates(
     match payload_result {
         Ok(payload) => match serialize_function_output(payload) {
             Ok(output) => {
-                let ToolOutput::Function { content, success } = &output else {
+                let ToolOutput::Function { body, success } = &output else {
                     unreachable!("MCP resource handler should return function output");
                 };
+                let content = body.to_text().unwrap_or_default();
                 let duration = start.elapsed();
                 emit_tool_call_end(
                     &session,
-                    &sub_id,
+                    turn.as_ref(),
                     &call_id,
                     invocation,
                     duration,
-                    Ok(call_tool_result_from_content(content, *success)),
+                    Ok(call_tool_result_from_content(&content, *success)),
                 )
                 .await;
                 Ok(output)
@@ -417,7 +427,7 @@ async fn handle_list_resource_templates(
                 let message = err.to_string();
                 emit_tool_call_end(
                     &session,
-                    &sub_id,
+                    turn.as_ref(),
                     &call_id,
                     invocation,
                     duration,
@@ -432,7 +442,7 @@ async fn handle_list_resource_templates(
             let message = err.to_string();
             emit_tool_call_end(
                 &session,
-                &sub_id,
+                turn.as_ref(),
                 &call_id,
                 invocation,
                 duration,
@@ -446,7 +456,7 @@ async fn handle_list_resource_templates(
 
 async fn handle_read_resource(
     session: Arc<Session>,
-    sub_id: String,
+    turn: Arc<TurnContext>,
     call_id: String,
     arguments: Option<Value>,
 ) -> Result<ToolOutput, FunctionCallError> {
@@ -461,12 +471,18 @@ async fn handle_read_resource(
         arguments: arguments.clone(),
     };
 
-    emit_tool_call_begin(&session, &sub_id, &call_id, invocation.clone()).await;
+    emit_tool_call_begin(&session, turn.as_ref(), &call_id, invocation.clone()).await;
     let start = Instant::now();
 
     let payload_result: Result<ReadResourcePayload, FunctionCallError> = async {
         let result = session
-            .read_resource(&server, ReadResourceRequestParams { uri: uri.clone() })
+            .read_resource(
+                &server,
+                ReadResourceRequestParams {
+                    meta: None,
+                    uri: uri.clone(),
+                },
+            )
             .await
             .map_err(|err| {
                 FunctionCallError::RespondToModel(format!("resources/read failed: {err:#}"))
@@ -483,17 +499,18 @@ async fn handle_read_resource(
     match payload_result {
         Ok(payload) => match serialize_function_output(payload) {
             Ok(output) => {
-                let ToolOutput::Function { content, success } = &output else {
+                let ToolOutput::Function { body, success } = &output else {
                     unreachable!("MCP resource handler should return function output");
                 };
+                let content = body.to_text().unwrap_or_default();
                 let duration = start.elapsed();
                 emit_tool_call_end(
                     &session,
-                    &sub_id,
+                    turn.as_ref(),
                     &call_id,
                     invocation,
                     duration,
-                    Ok(call_tool_result_from_content(content, *success)),
+                    Ok(call_tool_result_from_content(&content, *success)),
                 )
                 .await;
                 Ok(output)
@@ -503,7 +520,7 @@ async fn handle_read_resource(
                 let message = err.to_string();
                 emit_tool_call_end(
                     &session,
-                    &sub_id,
+                    turn.as_ref(),
                     &call_id,
                     invocation,
                     duration,
@@ -518,7 +535,7 @@ async fn handle_read_resource(
             let message = err.to_string();
             emit_tool_call_end(
                 &session,
-                &sub_id,
+                turn.as_ref(),
                 &call_id,
                 invocation,
                 duration,
@@ -532,51 +549,48 @@ async fn handle_read_resource(
 
 fn call_tool_result_from_content(content: &str, success: Option<bool>) -> CallToolResult {
     CallToolResult {
-        content: vec![ContentBlock::TextContent(TextContent {
-            annotations: None,
-            text: content.to_string(),
-            r#type: "text".to_string(),
-        })],
-        is_error: success.map(|value| !value),
+        content: vec![serde_json::json!({"type": "text", "text": content})],
         structured_content: None,
+        is_error: success.map(|value| !value),
+        meta: None,
     }
 }
 
 async fn emit_tool_call_begin(
     session: &Arc<Session>,
-    sub_id: &str,
+    turn: &TurnContext,
     call_id: &str,
     invocation: McpInvocation,
 ) {
     session
-        .send_event(Event {
-            id: sub_id.to_string(),
-            msg: EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
+        .send_event(
+            turn,
+            EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id: call_id.to_string(),
                 invocation,
             }),
-        })
+        )
         .await;
 }
 
 async fn emit_tool_call_end(
     session: &Arc<Session>,
-    sub_id: &str,
+    turn: &TurnContext,
     call_id: &str,
     invocation: McpInvocation,
     duration: Duration,
     result: Result<CallToolResult, String>,
 ) {
     session
-        .send_event(Event {
-            id: sub_id.to_string(),
-            msg: EventMsg::McpToolCallEnd(McpToolCallEndEvent {
+        .send_event(
+            turn,
+            EventMsg::McpToolCallEnd(McpToolCallEndEvent {
                 call_id: call_id.to_string(),
                 invocation,
                 duration,
                 result,
             }),
-        })
+        )
         .await;
 }
 
@@ -611,7 +625,7 @@ where
     })?;
 
     Ok(ToolOutput::Function {
-        content,
+        body: FunctionCallOutputBody::Text(content),
         success: Some(true),
     })
 }
@@ -620,9 +634,14 @@ fn parse_arguments(raw_args: &str) -> Result<Option<Value>, FunctionCallError> {
     if raw_args.trim().is_empty() {
         Ok(None)
     } else {
-        serde_json::from_str(raw_args).map(Some).map_err(|err| {
+        let value: Value = serde_json::from_str(raw_args).map_err(|err| {
             FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
-        })
+        })?;
+        if value.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
     }
 }
 
@@ -653,32 +672,34 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcp_types::ListResourcesResult;
-    use mcp_types::ResourceTemplate;
     use pretty_assertions::assert_eq;
+    use rmcp::model::AnnotateAble;
     use serde_json::json;
 
     fn resource(uri: &str, name: &str) -> Resource {
-        Resource {
-            annotations: None,
+        rmcp::model::RawResource {
+            uri: uri.to_string(),
+            name: name.to_string(),
+            title: None,
             description: None,
             mime_type: None,
-            name: name.to_string(),
             size: None,
-            title: None,
-            uri: uri.to_string(),
+            icons: None,
+            meta: None,
         }
+        .no_annotation()
     }
 
     fn template(uri_template: &str, name: &str) -> ResourceTemplate {
-        ResourceTemplate {
-            annotations: None,
-            description: None,
-            mime_type: None,
+        rmcp::model::RawResourceTemplate {
+            uri_template: uri_template.to_string(),
             name: name.to_string(),
             title: None,
-            uri_template: uri_template.to_string(),
+            description: None,
+            mime_type: None,
+            icons: None,
         }
+        .no_annotation()
     }
 
     #[test]
@@ -694,6 +715,7 @@ mod tests {
     #[test]
     fn list_resources_payload_from_single_server_copies_next_cursor() {
         let result = ListResourcesResult {
+            meta: None,
             next_cursor: Some("cursor-1".to_string()),
             resources: vec![resource("memo://id", "memo")],
         };
@@ -747,6 +769,11 @@ mod tests {
         assert!(
             parse_arguments(" \n\t").unwrap().is_none(),
             "expected None for empty arguments"
+        );
+
+        assert!(
+            parse_arguments("null").unwrap().is_none(),
+            "expected None for null arguments"
         );
 
         let value = parse_arguments(r#"{"server":"figma"}"#)

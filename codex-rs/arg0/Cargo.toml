@@ -1,7 +1,8 @@
 [package]
-edition = "2024"
 name = "codex-arg0"
-version = { workspace = true }
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [lib]
 name = "codex_arg0"
@@ -13,8 +14,9 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 codex-apply-patch = { workspace = true }
-codex-core = { workspace = true }
 codex-linux-sandbox = { workspace = true }
+codex-shell-escalation = { workspace = true }
+codex-utils-home-dir = { workspace = true }
 dotenvy = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

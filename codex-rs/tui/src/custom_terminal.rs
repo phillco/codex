@@ -33,6 +33,7 @@ use crossterm::style::SetBackgroundColor;
 use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
 use crossterm::terminal::Clear;
+use derive_more::IsVariant;
 use ratatui::backend::Backend;
 use ratatui::backend::ClearType;
 use ratatui::buffer::Buffer;
@@ -42,6 +43,40 @@ use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::widgets::WidgetRef;
+use unicode_width::UnicodeWidthStr;
+
+/// Returns the display width of a cell symbol, ignoring OSC escape sequences.
+///
+/// OSC sequences (e.g. OSC 8 hyperlinks: `\x1B]8;;URL\x07`) are terminal
+/// control sequences that don't consume display columns.  The standard
+/// `UnicodeWidthStr::width()` method incorrectly counts the printable
+/// characters inside OSC payloads (like `]`, `8`, `;`, and URL characters).
+/// This function strips them first so that only visible characters contribute
+/// to the width.
+fn display_width(s: &str) -> usize {
+    // Fast path: no escape sequences present.
+    if !s.contains('\x1B') {
+        return s.width();
+    }
+
+    // Strip OSC sequences: ESC ] ... BEL
+    let mut visible = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1B' && chars.clone().next() == Some(']') {
+            // Consume the ']' and everything up to and including BEL.
+            chars.next(); // skip ']'
+            for c in chars.by_ref() {
+                if c == '\x07' {
+                    break;
+                }
+            }
+            continue;
+        }
+        visible.push(ch);
+    }
+    visible.width()
+}
 
 #[derive(Debug, Hash)]
 pub struct Frame<'a> {
@@ -120,8 +155,8 @@ where
     /// Last known position of the cursor. Used to find the new area when the viewport is inlined
     /// and the terminal resized.
     pub last_known_cursor_pos: Position,
-
-    use_custom_flush: bool,
+    /// Count of visible history rows rendered above the viewport in inline mode.
+    visible_history_rows: u16,
 }
 
 impl<B> Drop for Terminal<B>
@@ -148,19 +183,21 @@ where
     /// Creates a new [`Terminal`] with the given [`Backend`] and [`TerminalOptions`].
     pub fn with_options(mut backend: B) -> io::Result<Self> {
         let screen_size = backend.size()?;
-        let cursor_pos = backend.get_cursor_position()?;
+        let cursor_pos = backend.get_cursor_position().unwrap_or_else(|err| {
+            // Some PTYs do not answer CPR (`ESC[6n`); continue with a safe default instead
+            // of failing TUI startup.
+            tracing::warn!("failed to read initial cursor position; defaulting to origin: {err}");
+            Position { x: 0, y: 0 }
+        });
         Ok(Self {
             backend,
-            buffers: [
-                Buffer::empty(Rect::new(0, 0, 0, 0)),
-                Buffer::empty(Rect::new(0, 0, 0, 0)),
-            ],
+            buffers: [Buffer::empty(Rect::ZERO), Buffer::empty(Rect::ZERO)],
             current: 0,
             hidden_cursor: false,
             viewport_area: Rect::new(0, cursor_pos.y, 0, 0),
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
-            use_custom_flush: true,
+            visible_history_rows: 0,
         })
     }
 
@@ -173,9 +210,24 @@ where
         }
     }
 
+    /// Gets the current buffer as a reference.
+    fn current_buffer(&self) -> &Buffer {
+        &self.buffers[self.current]
+    }
+
     /// Gets the current buffer as a mutable reference.
-    pub fn current_buffer_mut(&mut self) -> &mut Buffer {
+    fn current_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffers[self.current]
+    }
+
+    /// Gets the previous buffer as a reference.
+    fn previous_buffer(&self) -> &Buffer {
+        &self.buffers[1 - self.current]
+    }
+
+    /// Gets the previous buffer as a mutable reference.
+    fn previous_buffer_mut(&mut self) -> &mut Buffer {
+        &mut self.buffers[1 - self.current]
     }
 
     /// Gets the backend
@@ -191,26 +243,12 @@ where
     /// Obtains a difference between the previous and the current buffer and passes it to the
     /// current backend for drawing.
     pub fn flush(&mut self) -> io::Result<()> {
-        let previous_buffer = &self.buffers[1 - self.current];
-        let current_buffer = &self.buffers[self.current];
-
-        if self.use_custom_flush {
-            let updates = diff_buffers(previous_buffer, current_buffer);
-            if let Some(DrawCommand::Put { x, y, .. }) = updates
-                .iter()
-                .rev()
-                .find(|cmd| matches!(cmd, DrawCommand::Put { .. }))
-            {
-                self.last_known_cursor_pos = Position { x: *x, y: *y };
-            }
-            draw(&mut self.backend, updates.into_iter())
-        } else {
-            let updates = previous_buffer.diff(current_buffer);
-            if let Some((x, y, _)) = updates.last() {
-                self.last_known_cursor_pos = Position { x: *x, y: *y };
-            }
-            self.backend.draw(updates.into_iter())
+        let updates = diff_buffers(self.previous_buffer(), self.current_buffer());
+        let last_put_command = updates.iter().rfind(|command| command.is_put());
+        if let Some(&DrawCommand::Put { x, y, .. }) = last_put_command {
+            self.last_known_cursor_pos = Position { x, y };
         }
+        draw(&mut self.backend, updates.into_iter())
     }
 
     /// Updates the Terminal so that internal buffers match the requested area.
@@ -224,9 +262,10 @@ where
 
     /// Sets the viewport area.
     pub fn set_viewport_area(&mut self, area: Rect) {
-        self.buffers[self.current].resize(area);
-        self.buffers[1 - self.current].resize(area);
+        self.current_buffer_mut().resize(area);
+        self.previous_buffer_mut().resize(area);
         self.viewport_area = area;
+        self.visible_history_rows = self.visible_history_rows.min(area.top());
     }
 
     /// Queries the backend for size and resizes if it doesn't match the previous size.
@@ -337,7 +376,7 @@ where
 
         self.swap_buffers();
 
-        ratatui::backend::Backend::flush(&mut self.backend)?;
+        Backend::flush(&mut self.backend)?;
 
         Ok(())
     }
@@ -381,13 +420,74 @@ where
             .set_cursor_position(self.viewport_area.as_position())?;
         self.backend.clear_region(ClearType::AfterCursor)?;
         // Reset the back buffer to make sure the next update will redraw everything.
-        self.buffers[1 - self.current].reset();
+        self.previous_buffer_mut().reset();
         Ok(())
+    }
+
+    /// Clear terminal scrollback (if supported) and force a full redraw.
+    pub fn clear_scrollback(&mut self) -> io::Result<()> {
+        if self.viewport_area.is_empty() {
+            return Ok(());
+        }
+        let home = Position { x: 0, y: 0 };
+        // Use an explicit cursor-home around scrollback purge for terminals that
+        // are sensitive to inline viewport cursor placement (e.g. Terminal.app).
+        self.set_cursor_position(home)?;
+        queue!(self.backend, Clear(crossterm::terminal::ClearType::Purge))?;
+        self.set_cursor_position(home)?;
+        std::io::Write::flush(&mut self.backend)?;
+        self.previous_buffer_mut().reset();
+        Ok(())
+    }
+
+    /// Clear the entire visible screen (not just the viewport) and force a full redraw.
+    pub fn clear_visible_screen(&mut self) -> io::Result<()> {
+        let home = Position { x: 0, y: 0 };
+        // Some terminals (notably Terminal.app) behave more reliably if we pair ED2
+        // with an explicit cursor-home before/after, matching the common `clear`
+        // sequence (`CSI 2J` + `CSI H`).
+        self.set_cursor_position(home)?;
+        self.backend.clear_region(ClearType::All)?;
+        self.set_cursor_position(home)?;
+        std::io::Write::flush(&mut self.backend)?;
+        self.visible_history_rows = 0;
+        self.previous_buffer_mut().reset();
+        Ok(())
+    }
+
+    /// Hard-reset scrollback + visible screen using an explicit ANSI sequence.
+    ///
+    /// Some terminals behave more reliably when purge + clear are emitted as a
+    /// single ANSI sequence instead of separate backend commands.
+    pub fn clear_scrollback_and_visible_screen_ansi(&mut self) -> io::Result<()> {
+        if self.viewport_area.is_empty() {
+            return Ok(());
+        }
+
+        // Reset scroll region + style state, home cursor, clear screen, purge scrollback.
+        // The order matches the common shell `clear && printf '\\e[3J'` behavior.
+        write!(self.backend, "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
+        std::io::Write::flush(&mut self.backend)?;
+        self.last_known_cursor_pos = Position { x: 0, y: 0 };
+        self.visible_history_rows = 0;
+        self.previous_buffer_mut().reset();
+        Ok(())
+    }
+
+    pub fn visible_history_rows(&self) -> u16 {
+        self.visible_history_rows
+    }
+
+    pub(crate) fn note_history_rows_inserted(&mut self, inserted_rows: u16) {
+        self.visible_history_rows = self
+            .visible_history_rows
+            .saturating_add(inserted_rows)
+            .min(self.viewport_area.top());
     }
 
     /// Clears the inactive buffer and swaps it with the current buffer
     pub fn swap_buffers(&mut self) {
-        self.buffers[1 - self.current].reset();
+        self.previous_buffer_mut().reset();
         self.current = 1 - self.current;
     }
 
@@ -398,15 +498,14 @@ where
 }
 
 use ratatui::buffer::Cell;
-use unicode_width::UnicodeWidthStr;
 
-#[derive(Debug)]
-enum DrawCommand<'a> {
-    Put { x: u16, y: u16, cell: &'a Cell },
+#[derive(Debug, IsVariant)]
+enum DrawCommand {
+    Put { x: u16, y: u16, cell: Cell },
     ClearToEnd { x: u16, y: u16, bg: Color },
 }
 
-fn diff_buffers<'a>(a: &'a Buffer, b: &'a Buffer) -> Vec<DrawCommand<'a>> {
+fn diff_buffers(a: &Buffer, b: &Buffer) -> Vec<DrawCommand> {
     let previous_buffer = &a.content;
     let next_buffer = &b.content;
 
@@ -427,7 +526,7 @@ fn diff_buffers<'a>(a: &'a Buffer, b: &'a Buffer) -> Vec<DrawCommand<'a>> {
         let mut column = 0usize;
         while column < row.len() {
             let cell = &row[column];
-            let width = cell.symbol().width();
+            let width = display_width(cell.symbol());
             if cell.symbol() != " " || cell.bg != bg || cell.modifier != Modifier::empty() {
                 last_nonblank_column = column + (width.saturating_sub(1));
             }
@@ -455,22 +554,25 @@ fn diff_buffers<'a>(a: &'a Buffer, b: &'a Buffer) -> Vec<DrawCommand<'a>> {
                 updates.push(DrawCommand::Put {
                     x,
                     y,
-                    cell: &next_buffer[i],
+                    cell: next_buffer[i].clone(),
                 });
             }
         }
 
-        to_skip = current.symbol().width().saturating_sub(1);
+        to_skip = display_width(current.symbol()).saturating_sub(1);
 
-        let affected_width = std::cmp::max(current.symbol().width(), previous.symbol().width());
+        let affected_width = std::cmp::max(
+            display_width(current.symbol()),
+            display_width(previous.symbol()),
+        );
         invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
     }
     updates
 }
 
-fn draw<'a, I>(writer: &mut impl Write, commands: I) -> io::Result<()>
+fn draw<I>(writer: &mut impl Write, commands: I) -> io::Result<()>
 where
-    I: Iterator<Item = DrawCommand<'a>>,
+    I: Iterator<Item = DrawCommand>,
 {
     let mut fg = Color::Reset;
     let mut bg = Color::Reset;

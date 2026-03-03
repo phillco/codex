@@ -9,6 +9,7 @@ pub use api::CreatedTask;
 pub use api::DiffSummary;
 pub use api::Result;
 pub use api::TaskId;
+pub use api::TaskListPage;
 pub use api::TaskStatus;
 pub use api::TaskSummary;
 pub use api::TaskText;
@@ -26,4 +27,4 @@ pub use mock::MockClient;
 #[cfg(feature = "online")]
 pub use http::HttpClient;
 
-// Reusable apply engine now lives in the shared crate `codex-git-apply`.
+// Reusable apply engine now lives in the shared crate `codex-git`.

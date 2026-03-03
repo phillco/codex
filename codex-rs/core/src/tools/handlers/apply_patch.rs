@@ -1,28 +1,65 @@
+use codex_protocol::models::FunctionCallOutputBody;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::Path;
 
+use crate::apply_patch;
+use crate::apply_patch::InternalApplyPatchInvocation;
+use crate::apply_patch::convert_apply_patch_to_protocol;
 use crate::client_common::tools::FreeformTool;
 use crate::client_common::tools::FreeformToolFormat;
 use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
-use crate::exec::ExecParams;
+use crate::codex::Session;
+use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
-use crate::openai_tools::JsonSchema;
+use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
-use crate::tools::handle_container_exec_with_params;
+use crate::tools::events::ToolEmitter;
+use crate::tools::events::ToolEventCtx;
+use crate::tools::handlers::parse_arguments;
+use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use crate::tools::runtimes::apply_patch::ApplyPatchRequest;
+use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
+use crate::tools::sandboxing::ToolCtx;
 use crate::tools::spec::ApplyPatchToolArgs;
+use crate::tools::spec::JsonSchema;
 use async_trait::async_trait;
-use serde::Deserialize;
-use serde::Serialize;
+use codex_apply_patch::ApplyPatchAction;
+use codex_apply_patch::ApplyPatchFileChange;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use std::sync::Arc;
 
 pub struct ApplyPatchHandler;
 
 const APPLY_PATCH_LARK_GRAMMAR: &str = include_str!("tool_apply_patch.lark");
+
+fn file_paths_for_action(action: &ApplyPatchAction) -> Vec<AbsolutePathBuf> {
+    let mut keys = Vec::new();
+    let cwd = action.cwd.as_path();
+
+    for (path, change) in action.changes() {
+        if let Some(key) = to_abs_path(cwd, path) {
+            keys.push(key);
+        }
+
+        if let ApplyPatchFileChange::Update { move_path, .. } = change
+            && let Some(dest) = move_path
+            && let Some(key) = to_abs_path(cwd, dest)
+        {
+            keys.push(key);
+        }
+    }
+
+    keys
+}
+
+fn to_abs_path(cwd: &Path, path: &Path) -> Option<AbsolutePathBuf> {
+    AbsolutePathBuf::resolve_path_against_base(path, cwd).ok()
+}
 
 #[async_trait]
 impl ToolHandler for ApplyPatchHandler {
@@ -37,24 +74,24 @@ impl ToolHandler for ApplyPatchHandler {
         )
     }
 
+    async fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
+        true
+    }
+
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
             session,
             turn,
             tracker,
-            sub_id,
             call_id,
             tool_name,
             payload,
+            ..
         } = invocation;
 
         let patch_input = match payload {
             ToolPayload::Function { arguments } => {
-                let args: ApplyPatchToolArgs = serde_json::from_str(&arguments).map_err(|e| {
-                    FunctionCallError::RespondToModel(format!(
-                        "failed to parse function arguments: {e:?}"
-                    ))
-                })?;
+                let args: ApplyPatchToolArgs = parse_arguments(&arguments)?;
                 args.input
             }
             ToolPayload::Custom { input } => input,
@@ -65,38 +102,187 @@ impl ToolHandler for ApplyPatchHandler {
             }
         };
 
-        let exec_params = ExecParams {
-            command: vec!["apply_patch".to_string(), patch_input.clone()],
-            cwd: turn.cwd.clone(),
-            timeout_ms: None,
-            env: HashMap::new(),
-            with_escalated_permissions: None,
-            justification: None,
-        };
+        // Re-parse and verify the patch so we can compute changes and approval.
+        // Avoid building temporary ExecParams/command vectors; derive directly from inputs.
+        let cwd = turn.cwd.clone();
+        let command = vec!["apply_patch".to_string(), patch_input.clone()];
+        match codex_apply_patch::maybe_parse_apply_patch_verified(&command, &cwd) {
+            codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+                match apply_patch::apply_patch(turn.as_ref(), changes).await {
+                    InternalApplyPatchInvocation::Output(item) => {
+                        let content = item?;
+                        Ok(ToolOutput::Function {
+                            body: FunctionCallOutputBody::Text(content),
+                            success: Some(true),
+                        })
+                    }
+                    InternalApplyPatchInvocation::DelegateToExec(apply) => {
+                        let changes = convert_apply_patch_to_protocol(&apply.action);
+                        let file_paths = file_paths_for_action(&apply.action);
+                        let emitter =
+                            ToolEmitter::apply_patch(changes.clone(), apply.auto_approved);
+                        let event_ctx = ToolEventCtx::new(
+                            session.as_ref(),
+                            turn.as_ref(),
+                            &call_id,
+                            Some(&tracker),
+                        );
+                        emitter.begin(event_ctx).await;
 
-        let content = handle_container_exec_with_params(
-            tool_name.as_str(),
-            exec_params,
-            Arc::clone(&session),
-            Arc::clone(&turn),
-            Arc::clone(&tracker),
-            sub_id.clone(),
-            call_id.clone(),
-        )
-        .await?;
+                        let req = ApplyPatchRequest {
+                            action: apply.action,
+                            file_paths,
+                            changes,
+                            exec_approval_requirement: apply.exec_approval_requirement,
+                            timeout_ms: None,
+                            codex_exe: turn.codex_linux_sandbox_exe.clone(),
+                        };
 
-        Ok(ToolOutput::Function {
-            content,
-            success: Some(true),
-        })
+                        let mut orchestrator = ToolOrchestrator::new();
+                        let mut runtime = ApplyPatchRuntime::new();
+                        let tool_ctx = ToolCtx {
+                            session: session.clone(),
+                            turn: turn.clone(),
+                            call_id: call_id.clone(),
+                            tool_name: tool_name.to_string(),
+                        };
+                        let out = orchestrator
+                            .run(
+                                &mut runtime,
+                                &req,
+                                &tool_ctx,
+                                turn.as_ref(),
+                                turn.approval_policy.value(),
+                            )
+                            .await
+                            .map(|result| result.output);
+                        let event_ctx = ToolEventCtx::new(
+                            session.as_ref(),
+                            turn.as_ref(),
+                            &call_id,
+                            Some(&tracker),
+                        );
+                        let content = emitter.finish(event_ctx, out).await?;
+                        Ok(ToolOutput::Function {
+                            body: FunctionCallOutputBody::Text(content),
+                            success: Some(true),
+                        })
+                    }
+                }
+            }
+            codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
+                Err(FunctionCallError::RespondToModel(format!(
+                    "apply_patch verification failed: {parse_error}"
+                )))
+            }
+            codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
+                tracing::trace!("Failed to parse apply_patch input, {error:?}");
+                Err(FunctionCallError::RespondToModel(
+                    "apply_patch handler received invalid patch input".to_string(),
+                ))
+            }
+            codex_apply_patch::MaybeApplyPatchVerified::NotApplyPatch => {
+                Err(FunctionCallError::RespondToModel(
+                    "apply_patch handler received non-apply_patch input".to_string(),
+                ))
+            }
+        }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum ApplyPatchToolType {
-    Freeform,
-    Function,
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn intercept_apply_patch(
+    command: &[String],
+    cwd: &Path,
+    timeout_ms: Option<u64>,
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    tracker: Option<&SharedTurnDiffTracker>,
+    call_id: &str,
+    tool_name: &str,
+) -> Result<Option<ToolOutput>, FunctionCallError> {
+    match codex_apply_patch::maybe_parse_apply_patch_verified(command, cwd) {
+        codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+            session
+                .record_model_warning(
+                    format!(
+                        "apply_patch was requested via {tool_name}. Use the apply_patch tool instead of exec_command."
+                    ),
+                    turn.as_ref(),
+                )
+                .await;
+            match apply_patch::apply_patch(turn.as_ref(), changes).await {
+                InternalApplyPatchInvocation::Output(item) => {
+                    let content = item?;
+                    Ok(Some(ToolOutput::Function {
+                        body: FunctionCallOutputBody::Text(content),
+                        success: Some(true),
+                    }))
+                }
+                InternalApplyPatchInvocation::DelegateToExec(apply) => {
+                    let changes = convert_apply_patch_to_protocol(&apply.action);
+                    let approval_keys = file_paths_for_action(&apply.action);
+                    let emitter = ToolEmitter::apply_patch(changes.clone(), apply.auto_approved);
+                    let event_ctx = ToolEventCtx::new(
+                        session.as_ref(),
+                        turn.as_ref(),
+                        call_id,
+                        tracker.as_ref().copied(),
+                    );
+                    emitter.begin(event_ctx).await;
+
+                    let req = ApplyPatchRequest {
+                        action: apply.action,
+                        file_paths: approval_keys,
+                        changes,
+                        exec_approval_requirement: apply.exec_approval_requirement,
+                        timeout_ms,
+                        codex_exe: turn.codex_linux_sandbox_exe.clone(),
+                    };
+
+                    let mut orchestrator = ToolOrchestrator::new();
+                    let mut runtime = ApplyPatchRuntime::new();
+                    let tool_ctx = ToolCtx {
+                        session: session.clone(),
+                        turn: turn.clone(),
+                        call_id: call_id.to_string(),
+                        tool_name: tool_name.to_string(),
+                    };
+                    let out = orchestrator
+                        .run(
+                            &mut runtime,
+                            &req,
+                            &tool_ctx,
+                            turn.as_ref(),
+                            turn.approval_policy.value(),
+                        )
+                        .await
+                        .map(|result| result.output);
+                    let event_ctx = ToolEventCtx::new(
+                        session.as_ref(),
+                        turn.as_ref(),
+                        call_id,
+                        tracker.as_ref().copied(),
+                    );
+                    let content = emitter.finish(event_ctx, out).await?;
+                    Ok(Some(ToolOutput::Function {
+                        body: FunctionCallOutputBody::Text(content),
+                        success: Some(true),
+                    }))
+                }
+            }
+        }
+        codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
+            Err(FunctionCallError::RespondToModel(format!(
+                "apply_patch verification failed: {parse_error}"
+            )))
+        }
+        codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
+            tracing::trace!("Failed to parse apply_patch input, {error:?}");
+            Ok(None)
+        }
+        codex_apply_patch::MaybeApplyPatchVerified::NotApplyPatch => Ok(None),
+    }
 }
 
 /// Returns a custom tool that can be used to edit files. Well-suited for GPT-5 models
@@ -201,4 +387,36 @@ It is important to remember:
             additional_properties: Some(false.into()),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_apply_patch::MaybeApplyPatchVerified;
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    #[test]
+    fn approval_keys_include_move_destination() {
+        let tmp = TempDir::new().expect("tmp");
+        let cwd = tmp.path();
+        std::fs::create_dir_all(cwd.join("old")).expect("create old dir");
+        std::fs::create_dir_all(cwd.join("renamed/dir")).expect("create dest dir");
+        std::fs::write(cwd.join("old/name.txt"), "old content\n").expect("write old file");
+        let patch = r#"*** Begin Patch
+*** Update File: old/name.txt
+*** Move to: renamed/dir/name.txt
+@@
+-old content
++new content
+*** End Patch"#;
+        let argv = vec!["apply_patch".to_string(), patch.to_string()];
+        let action = match codex_apply_patch::maybe_parse_apply_patch_verified(&argv, cwd) {
+            MaybeApplyPatchVerified::Body(action) => action,
+            other => panic!("expected patch body, got: {other:?}"),
+        };
+
+        let keys = file_paths_for_action(&action);
+        assert_eq!(keys.len(), 2);
+    }
 }

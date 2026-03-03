@@ -12,14 +12,14 @@ use codex_app_server_protocol::NewConversationResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SendUserMessageParams;
 use codex_app_server_protocol::SendUserMessageResponse;
-use codex_core::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnAbortReason;
 use core_test_support::skip_if_no_network;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
 use app_test_support::McpProcess;
-use app_test_support::create_mock_chat_completions_server;
-use app_test_support::create_shell_sse_response;
+use app_test_support::create_mock_responses_server_sequence;
+use app_test_support::create_shell_command_sse_response;
 use app_test_support::to_response;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -56,7 +56,7 @@ async fn shell_command_interruption() -> anyhow::Result<()> {
     std::fs::create_dir(&working_directory)?;
 
     // Create mock server with a single SSE response: the long sleep command
-    let server = create_mock_chat_completions_server(vec![create_shell_sse_response(
+    let server = create_mock_responses_server_sequence(vec![create_shell_command_sse_response(
         shell_command.clone(),
         Some(&working_directory),
         Some(10_000), // 10 seconds timeout in ms
@@ -88,7 +88,10 @@ async fn shell_command_interruption() -> anyhow::Result<()> {
 
     // 2) addConversationListener
     let add_listener_id = mcp
-        .send_add_conversation_listener_request(AddConversationListenerParams { conversation_id })
+        .send_add_conversation_listener_request(AddConversationListenerParams {
+            conversation_id,
+            experimental_raw_events: false,
+        })
         .await?;
     let _add_listener_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -102,6 +105,7 @@ async fn shell_command_interruption() -> anyhow::Result<()> {
             conversation_id,
             items: vec![codex_app_server_protocol::InputItem::Text {
                 text: "run first sleep command".to_string(),
+                text_elements: Vec::new(),
             }],
         })
         .await?;
@@ -150,7 +154,7 @@ model_provider = "mock_provider"
 [model_providers.mock_provider]
 name = "Mock provider for test"
 base_url = "{server_uri}/v1"
-wire_api = "chat"
+wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0
 "#
